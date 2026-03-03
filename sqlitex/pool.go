@@ -21,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-llsqlite/crawshaw"
+	sqlite "github.com/go-llsqlite/crawshaw"
 )
 
 // Pool is a pool of SQLite connections.
@@ -231,7 +231,12 @@ var PoolCloseTimeout = 5 * time.Second
 // Close will panic if not all connections are returned before
 // PoolCloseTimeout.
 func (p *Pool) Close() (err error) {
-	close(p.closed)
+	select {
+	case <-p.closed:
+		return nil
+	default:
+		close(p.closed)
+	}
 
 	p.mu.RLock()
 	for _, cancel := range p.all {
