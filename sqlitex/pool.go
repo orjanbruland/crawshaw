@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"runtime/trace"
 	"sync"
-	"time"
 
 	sqlite "github.com/go-llsqlite/crawshaw"
 )
@@ -102,7 +101,7 @@ func OpenInit(ctx context.Context, uri string, flags sqlite.OpenFlags, poolSize 
 	defer func() {
 		// If an error occurred, call Close outside the lock so this doesn't deadlock.
 		if err != nil {
-			p.Close()
+			p.Close(ctx)
 		}
 	}()
 
@@ -218,19 +217,13 @@ func (p *Pool) Put(conn *sqlite.Conn) {
 	p.free <- conn
 }
 
-// PoolCloseTimeout is the maximum time for Pool.Close to wait for all Conns to
-// be returned to the Pool.
-//
-// Do not modify this concurrently with calling Pool.Close.
-var PoolCloseTimeout = 5 * time.Second
-
 // Close interrupts and closes all the connections in the Pool.
 //
 // Close blocks until all connections are returned to the Pool.
 //
-// Close will panic if not all connections are returned before
-// PoolCloseTimeout.
-func (p *Pool) Close() (err error) {
+// Close will return an error if not all connections are returned before
+// the context expires.
+func (p *Pool) Close(ctx context.Context) (err error) {
 	select {
 	case <-p.closed:
 		return nil
@@ -244,7 +237,6 @@ func (p *Pool) Close() (err error) {
 	}
 	p.mu.RUnlock()
 
-	timeout := time.After(PoolCloseTimeout)
 	for closed := 0; closed < len(p.all); closed++ {
 		select {
 		case conn := <-p.free:
@@ -252,8 +244,8 @@ func (p *Pool) Close() (err error) {
 			if err == nil {
 				err = err2
 			}
-		case <-timeout:
-			panic("not all connections returned to Pool before timeout")
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 	return

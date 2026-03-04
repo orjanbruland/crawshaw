@@ -1,6 +1,6 @@
 module github.com/go-llsqlite/crawshaw
 
-go 1.18
+go 1.24
 
 require (
 	github.com/anacrolix/chansync v0.3.0

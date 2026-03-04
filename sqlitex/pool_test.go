@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-llsqlite/crawshaw"
+	sqlite "github.com/go-llsqlite/crawshaw"
 	"github.com/go-llsqlite/crawshaw/sqlitex"
 )
 
@@ -50,7 +50,7 @@ func newMemPool(t *testing.T) *sqlitex.Pool {
 func TestPool(t *testing.T) {
 	dbpool := newMemPool(t)
 	defer func() {
-		if err := dbpool.Close(); err != nil {
+		if err := dbpool.Close(t.Context()); err != nil {
 			t.Error(err)
 		}
 	}()
@@ -124,7 +124,7 @@ func TestPoolAfterClose(t *testing.T) {
 	// verify that Get after close never try to initialize a Conn and segfault
 	dbpool := newMemPool(t)
 
-	err := dbpool.Close()
+	err := dbpool.Close(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,10 +228,10 @@ func TestPoolPutMatch(t *testing.T) {
 	dbpool0 := newMemPool(t)
 	dbpool1 := newMemPool(t)
 	defer func() {
-		if err := dbpool0.Close(); err != nil {
+		if err := dbpool0.Close(t.Context()); err != nil {
 			t.Error(err)
 		}
-		if err := dbpool1.Close(); err != nil {
+		if err := dbpool1.Close(t.Context()); err != nil {
 			t.Error(err)
 		}
 	}()
@@ -261,7 +261,7 @@ func TestPoolOpenInit(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() {
-			if err := dbpool.Close(); err != nil {
+			if err := dbpool.Close(t.Context()); err != nil {
 				t.Error(err)
 			}
 		}()
@@ -281,7 +281,7 @@ func TestPoolOpenInit(t *testing.T) {
 		if err != nil {
 			return
 		}
-		if err := dbpool.Close(); err != nil {
+		if err := dbpool.Close(t.Context()); err != nil {
 			t.Error(err)
 		}
 		t.Fatal("an invalid script must fail initialization")
@@ -297,7 +297,7 @@ func TestPoolOpenInit(t *testing.T) {
 		if err != nil {
 			return
 		}
-		if err := dbpool.Close(); err != nil {
+		if err := dbpool.Close(t.Context()); err != nil {
 			t.Error(err)
 		}
 		t.Fatal("a cancelled context should interrupt initialization")

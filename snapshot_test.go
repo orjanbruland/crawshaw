@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-llsqlite/crawshaw"
+	sqlite "github.com/go-llsqlite/crawshaw"
 	"github.com/go-llsqlite/crawshaw/sqlitex"
 )
 
@@ -54,7 +54,7 @@ func initDB(t *testing.T) (*sqlite.Conn, *sqlitex.Pool, func()) {
 		t.Fatal(err)
 	}
 	cleanup := func() {
-		pool.Close()
+		pool.Close(t.Context())
 		conn.Close()
 		os.Remove(db)
 	}
