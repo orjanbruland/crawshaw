@@ -17,7 +17,6 @@
 
 package sqlite
 
-import "C"
 import (
 	"bytes"
 	"runtime"
