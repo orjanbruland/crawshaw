@@ -17,7 +17,7 @@ func TestResult(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	insert := func(t *testing.T, value interface{}) {
+	insert := func(t *testing.T, value any) {
 		t.Helper()
 		err := Exec(conn, "INSERT INTO t (c1) VALUES (?);", nil, value)
 		if err != nil {

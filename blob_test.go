@@ -192,7 +192,7 @@ func TestConcurrentBlobWrites(t *testing.T) {
 	stmt := c.Prep("INSERT INTO blobs (col) VALUES ($col);")
 	stmt.SetZeroBlob("$col", 1024)
 	var blobRowIDs []int64
-	for i := 0; i < numBlobs; i++ {
+	for range numBlobs {
 		if _, err := stmt.Step(); err != nil {
 			t.Fatal(err)
 		}
@@ -206,7 +206,7 @@ func TestConcurrentBlobWrites(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < numBlobs; i++ {
+	for i := range numBlobs {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -225,7 +225,7 @@ func TestConcurrentBlobWrites(t *testing.T) {
 				return
 			}
 			defer blob.Close()
-			for j := 0; j < 10; j++ {
+			for j := range 10 {
 				b[1] = byte(j)
 
 				n, err := blob.WriteAt(b, 0)

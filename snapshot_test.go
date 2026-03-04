@@ -59,7 +59,7 @@ func initDB(t *testing.T) (*sqlite.Conn, *sqlitex.Pool, func()) {
 		os.Remove(db)
 	}
 
-	for i := 0; i < poolSize; i++ {
+	for range poolSize {
 		c := pool.Get(nil)
 		if err := sqlitex.ExecScript(c, `PRAGMA application_id;`); err != nil {
 			cleanup()

@@ -118,7 +118,7 @@ func OpenInit(ctx context.Context, uri string, flags sqlite.OpenFlags, poolSize 
 	flags |= sqlitex_pool
 
 	p.all = make(map[*sqlite.Conn]context.CancelFunc)
-	for i := 0; i < poolSize; i++ {
+	for range poolSize {
 		conn, err := sqlite.OpenConn(uri, flags)
 		if err != nil {
 			return nil, err

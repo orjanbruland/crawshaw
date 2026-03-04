@@ -66,10 +66,10 @@ func TestPool(t *testing.T) {
 	c = nil
 
 	var wg sync.WaitGroup
-	for i := 0; i < poolSize; i++ {
+	for i := range poolSize {
 		wg.Add(1)
 		go func(i int) {
-			for j := 0; j < 10; j++ {
+			for j := range 10 {
 				testInsert(t, fmt.Sprintf("%d-%d", i, j), dbpool)
 			}
 			wg.Done()
@@ -106,7 +106,7 @@ func testInsert(t *testing.T, id string, dbpool *sqlitex.Pool) {
 	if _, err := begin.Step(); err != nil {
 		t.Errorf("id=%s: BEGIN step: %v", id, err)
 	}
-	for i := int64(0); i < insertCount; i++ {
+	for i := range int64(insertCount) {
 		if err := stmt.Reset(); err != nil {
 			t.Errorf("id=%s: reset: %v", id, err)
 		}
@@ -129,7 +129,7 @@ func TestPoolAfterClose(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10*poolSize; i++ {
+	for range 10 * poolSize {
 		conn := dbpool.Get(nil)
 		if conn != nil {
 			t.Fatal("dbpool: Get after Close -> !nil conn")
@@ -266,7 +266,7 @@ func TestPoolOpenInit(t *testing.T) {
 			}
 		}()
 
-		for i := 0; i < poolSize; i++ {
+		for range poolSize {
 			conn := dbpool.Get(nil)
 			defer dbpool.Put(conn)
 			if err := sqlitex.ExecScript(conn, `SELECT * FROM v;`); err != nil {
