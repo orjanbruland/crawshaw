@@ -32,7 +32,7 @@ import (
 
 	qt "github.com/frankban/quicktest"
 
-	"github.com/go-llsqlite/crawshaw"
+	sqlite "github.com/go-llsqlite/crawshaw"
 	"github.com/go-llsqlite/crawshaw/sqlitex"
 )
 
