@@ -16,6 +16,7 @@ package sqlitex_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -55,7 +56,10 @@ func TestPool(t *testing.T) {
 		}
 	}()
 
-	c := dbpool.Get(nil)
+	c, err := dbpool.Get(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	c.Prep("DROP TABLE IF EXISTS footable;").Step()
 	if hasRow, err := c.Prep("CREATE TABLE footable (col1 integer);").Step(); err != nil {
 		t.Fatal(err)
@@ -77,7 +81,10 @@ func TestPool(t *testing.T) {
 	}
 	wg.Wait()
 
-	c = dbpool.Get(nil)
+	c, err = dbpool.Get(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer dbpool.Put(c)
 	stmt := c.Prep("SELECT COUNT(*) FROM footable;")
 	if hasRow, err := stmt.Step(); err != nil {
@@ -96,7 +103,10 @@ func TestPool(t *testing.T) {
 const insertCount = 120
 
 func testInsert(t *testing.T, id string, dbpool *sqlitex.Pool) {
-	c := dbpool.Get(nil)
+	c, err := dbpool.Get(nil)
+	if err != nil {
+		t.Fatalf("id=%s: dbpool.Get: %v", id, err)
+	}
 	defer dbpool.Put(c)
 
 	begin := c.Prep("BEGIN;")
@@ -130,7 +140,10 @@ func TestPoolAfterClose(t *testing.T) {
 	}
 
 	for range 10 * poolSize {
-		conn := dbpool.Get(nil)
+		conn, err := dbpool.Get(nil)
+		if !errors.Is(err, sqlitex.ErrPoolClosed) {
+			t.Fatalf("dbpool: Get after Close -> unexpected error: %v", err)
+		}
 		if conn != nil {
 			t.Fatal("dbpool: Get after Close -> !nil conn")
 		}
@@ -237,15 +250,18 @@ func TestPoolPutMatch(t *testing.T) {
 	}()
 
 	func() {
-		c := dbpool0.Get(nil)
-		defer func() {
-			if r := recover(); r == nil {
-				t.Error("expect put mismatch panic, got none")
-			}
-			dbpool0.Put(c)
-		}()
-
-		dbpool1.Put(c)
+		c, err := dbpool0.Get(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = dbpool1.Put(c)
+		if err == nil {
+			t.Error("expect put mismatch error, got none")
+		}
+		err = dbpool0.Put(c)
+		if err != nil {
+			t.Fatalf("expect put match error, got %v", err)
+		}
 	}()
 }
 
@@ -267,7 +283,10 @@ func TestPoolOpenInit(t *testing.T) {
 		}()
 
 		for range poolSize {
-			conn := dbpool.Get(nil)
+			conn, err := dbpool.Get(nil)
+			if err != nil {
+				t.Fatalf("dbpool.Get: %v", err)
+			}
 			defer dbpool.Put(conn)
 			if err := sqlitex.ExecScript(conn, `SELECT * FROM v;`); err != nil {
 				t.Fatalf("initScript not run on connection: %s", err)
@@ -284,22 +303,10 @@ func TestPoolOpenInit(t *testing.T) {
 		if err := dbpool.Close(t.Context()); err != nil {
 			t.Error(err)
 		}
-		t.Fatal("an invalid script must fail initialization")
-	})
-	t.Run("interrupted", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		initScript := `
-                CREATE TABLE IF NOT EXISTS t(a INT, b INT);
-                CREATE TEMP VIEW v AS SELECT a FROM t;
-`
-		dbpool, err := sqlitex.OpenInit(ctx, poolURI, poolFlags, poolSize, initScript)
-		if err != nil {
-			return
+
+		_, err = dbpool.Get(ctx)
+		if err == nil {
+			t.Fatal("an invalid script must fail initialization")
 		}
-		if err := dbpool.Close(t.Context()); err != nil {
-			t.Error(err)
-		}
-		t.Fatal("a cancelled context should interrupt initialization")
 	})
 }

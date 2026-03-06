@@ -16,12 +16,15 @@ package sqlitex
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime/trace"
 	"sync"
 
 	sqlite "github.com/go-llsqlite/crawshaw"
 )
+
+var ErrPoolClosed = errors.New("sqlite: pool is closed")
 
 // Pool is a pool of SQLite connections.
 //
@@ -34,22 +37,27 @@ import (
 //	defer dbpool.Put(conn)
 //
 // As Get may block, a context can be used to return if a task
-// is cancelled. In this case the Conn returned will be nil:
+// is cancelled. In this case the Conn returned will be nil, and the error will
+// be context.Canceled or context.DeadlineExceeded, or ErrPoolClosed if the pool is closed:
 //
-//	conn := dbpool.Get(ctx)
-//	if conn == nil {
-//		return context.Canceled
+//	conn, err := dbpool.Get(ctx)
+//	if err != nil {
+//		panic(err)
 //	}
 //	defer dbpool.Put(conn)
 type Pool struct {
 	// If checkReset, the Put method checks all of the connection's
 	// prepared statements and ensures they were correctly cleaned up.
-	// If they were not, Put will panic with details.
+	// If they were not, Put returns an error with details.
 	//
 	// TODO: export this? Is it enough of a performance concern?
 	checkReset bool
 
-	free   chan *sqlite.Conn
+	config PoolConfig
+
+	wg     sync.WaitGroup
+	active chan struct{}
+	idle   chan *sqlite.Conn
 	closed chan struct{}
 
 	all map[*sqlite.Conn]context.CancelFunc
@@ -89,24 +97,55 @@ func Open(uri string, flags sqlite.OpenFlags, poolSize int) (pool *Pool, err err
 // do not run INSERT in any of the initScripts or else it may create duplicate
 // data unintentionally or fail.
 func OpenInit(ctx context.Context, uri string, flags sqlite.OpenFlags, poolSize int, initScript string) (pool *Pool, err error) {
-	if uri == ":memory:" {
+	return OpenConfig(ctx, PoolConfig{
+		URI:          uri,
+		Flags:        flags,
+		MaxOpenConns: poolSize,
+		MaxIdleConns: poolSize,
+		InitScript:   initScript,
+	})
+}
+
+// PoolConfig is a configuration struct for OpenConfig.
+type PoolConfig struct {
+	URI string
+
+	// A flags value of 0 defaults to:
+	//
+	//	SQLITE_OPEN_READWRITE
+	//	SQLITE_OPEN_CREATE
+	//	SQLITE_OPEN_WAL
+	//	SQLITE_OPEN_URI
+	//	SQLITE_OPEN_NOMUTEX
+	Flags sqlite.OpenFlags
+
+	// MaxOpenConns controls the maximum number of open connections to the database.
+	// If MaxOpenConns is less than or equal to 0, there is no limit on the number of open connections.
+	MaxOpenConns int
+
+	// MaxIdleConns controls the maximum number of idle connections in the pool.
+	// If MaxOpenConns is set and MaxIdleConns is greater than MaxOpenConns, it is reduced to match MaxOpenConns.
+	// If MaxIdleConns is less than or equal to 0, it is set to 1.
+	MaxIdleConns int
+
+	// Each initScript is run an all Conns in the Pool. This is intended for PRAGMA
+	// or CREATE TEMP VIEW which need to be run on all connections.
+	//
+	// WARNING: Ensure all queries in initScript are completely idempotent, meaning
+	// that running it multiple times is the same as running it once. For example
+	// do not run INSERT in any of the initScripts or else it may create duplicate
+	// data unintentionally or fail.
+	InitScript string
+}
+
+// OpenConfig opens a pool of SQLite connections with the provided configuration.
+func OpenConfig(ctx context.Context, config PoolConfig) (pool *Pool, err error) {
+	if config.URI == ":memory:" {
 		return nil, strerror{msg: `sqlite: ":memory:" does not work with multiple connections, use "file::memory:?mode=memory"`}
 	}
 
-	p := &Pool{
-		checkReset: true,
-		free:       make(chan *sqlite.Conn, poolSize),
-		closed:     make(chan struct{}),
-	}
-	defer func() {
-		// If an error occurred, call Close outside the lock so this doesn't deadlock.
-		if err != nil {
-			p.Close(ctx)
-		}
-	}()
-
-	if flags == 0 {
-		flags = sqlite.SQLITE_OPEN_READWRITE |
+	if config.Flags == 0 {
+		config.Flags = sqlite.SQLITE_OPEN_READWRITE |
 			sqlite.SQLITE_OPEN_CREATE |
 			sqlite.SQLITE_OPEN_WAL |
 			sqlite.SQLITE_OPEN_URI |
@@ -115,33 +154,31 @@ func OpenInit(ctx context.Context, uri string, flags sqlite.OpenFlags, poolSize 
 
 	// sqlitex_pool is also defined in package sqlite
 	const sqlitex_pool = sqlite.OpenFlags(0x01000000)
-	flags |= sqlitex_pool
+	config.Flags |= sqlitex_pool
 
-	p.all = make(map[*sqlite.Conn]context.CancelFunc)
-	for range poolSize {
-		conn, err := sqlite.OpenConn(uri, flags)
-		if err != nil {
-			return nil, err
-		}
-		p.free <- conn
-		p.all[conn] = func() {}
+	if config.MaxIdleConns > config.MaxOpenConns && config.MaxOpenConns > 0 {
+		config.MaxIdleConns = config.MaxOpenConns
+	}
+	config.MaxIdleConns = max(config.MaxIdleConns, 1)
 
-		if initScript != "" {
-			conn.SetInterrupt(ctx.Done())
-			if err := ExecScript(conn, initScript); err != nil {
-				return nil, err
-			}
-			conn.SetInterrupt(nil)
-		}
+	p := &Pool{
+		checkReset: true,
+		config:     config,
+		idle:       make(chan *sqlite.Conn, config.MaxIdleConns),
+		closed:     make(chan struct{}),
+		all:        make(map[*sqlite.Conn]context.CancelFunc),
 	}
 
+	if config.MaxOpenConns > 0 {
+		p.active = make(chan struct{}, config.MaxOpenConns)
+	}
 	return p, nil
 }
 
 // Get returns an SQLite connection from the Pool.
 //
 // If no Conn is available, Get will block until one is, or until either the
-// Pool is closed or the context expires. If no Conn can be obtained, nil is
+// Pool is closed or the context expires. If no Conn can be obtained, an error is
 // returned.
 //
 // The provided context is used to control the execution lifetime of the
@@ -149,7 +186,7 @@ func OpenInit(ctx context.Context, uri string, flags sqlite.OpenFlags, poolSize 
 //
 // Applications must ensure that all non-nil Conns returned from Get are
 // returned to the same Pool with Put.
-func (p *Pool) Get(ctx context.Context) *sqlite.Conn {
+func (p *Pool) Get(ctx context.Context) (conn *sqlite.Conn, err error) {
 	var tr sqlite.Tracer
 	if ctx != nil {
 		tr = &tracer{ctx: ctx}
@@ -159,47 +196,91 @@ func (p *Pool) Get(ctx context.Context) *sqlite.Conn {
 	var cancel context.CancelFunc
 	ctx, cancel = context.WithCancel(ctx)
 
-outer:
-	select {
-	case conn := <-p.free:
-		p.mu.Lock()
-		defer p.mu.Unlock()
+	defer func() {
+		if conn == nil {
+			cancel()
+		}
+	}()
 
+	select {
+	case <-p.closed:
+		return nil, ErrPoolClosed
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+		// If the pool is not closed and the context is not already expired, try to get a connection.
+	}
+
+	// Acquire an active slot before getting a connection (from idle or new).
+	// This ensures the active semaphore accurately tracks checked-out connections,
+	// preventing deadlocks when multiple goroutines concurrently request connections
+	// from a pool with MaxOpenConns set.
+	if p.active != nil {
 		select {
+		case p.active <- struct{}{}:
 		case <-p.closed:
-			p.free <- conn
-			break outer
-		default:
+			return nil, ErrPoolClosed
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 
-		conn.SetTracer(tr)
-		conn.SetInterrupt(ctx.Done())
-
-		p.all[conn] = cancel
-
-		return conn
-	case <-ctx.Done():
-	case <-p.closed:
+		defer func() {
+			if err != nil {
+				// If an error occurred, release the active slot so it can be used by another Get.
+				<-p.active
+			}
+		}()
 	}
-	cancel()
-	return nil
+
+	var newConn bool
+	select {
+	case conn = <-p.idle:
+		// Pick a connection from the idle pool if one is available.
+	default:
+		newConn = true
+		var err error
+		conn, err = sqlite.OpenConn(p.config.URI, p.config.Flags)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	conn.SetTracer(tr)
+	conn.SetInterrupt(ctx.Done())
+
+	if newConn && p.config.InitScript != "" {
+		if err := ExecScript(conn, p.config.InitScript); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
+
+	if newConn {
+		p.wg.Add(1)
+	}
+
+	p.mu.Lock()
+	p.all[conn] = cancel
+	p.mu.Unlock()
+
+	return conn, nil
 }
 
 // Put puts an SQLite connection back into the Pool.
 //
-// Put will panic if conn is nil or if the conn was not originally created by
+// Put will return an error if conn is nil or if the conn was not originally created by
 // p.
 //
 // Applications must ensure that all non-nil Conns returned from Get are
 // returned to the same Pool with Put.
-func (p *Pool) Put(conn *sqlite.Conn) {
+func (p *Pool) Put(conn *sqlite.Conn) error {
 	if conn == nil {
-		panic("attempted to Put a nil Conn into Pool")
+		return fmt.Errorf("attempted to Put a nil Conn into Pool")
 	}
 	if p.checkReset {
 		query := conn.CheckReset()
 		if query != "" {
-			panic(fmt.Sprintf(
+			panic(fmt.Errorf(
 				"connection returned to pool has active statement: %q",
 				query))
 		}
@@ -210,11 +291,31 @@ func (p *Pool) Put(conn *sqlite.Conn) {
 	p.mu.RUnlock()
 
 	if !found {
-		panic("sqlite.Pool.Put: connection not created by this pool")
+		return fmt.Errorf("sqlite.Pool.Put: connection not created by this pool")
 	}
 
 	cancel()
-	p.free <- conn
+
+	// Always release the active slot since Get always acquires one.
+	if p.active != nil {
+		<-p.active
+	}
+
+	select {
+	case p.idle <- conn:
+		// Put the connection back into the idle pool if there's room.
+	default:
+		// If the idle pool is full, close the connection and remove it from the pool.
+		p.mu.Lock()
+		delete(p.all, conn)
+		p.wg.Done()
+		p.mu.Unlock()
+
+		if err := conn.Close(); err != nil {
+			return fmt.Errorf("failed to close connection: %v", err)
+		}
+	}
+	return nil
 }
 
 // Close interrupts and closes all the connections in the Pool.
@@ -237,18 +338,25 @@ func (p *Pool) Close(ctx context.Context) (err error) {
 	}
 	p.mu.RUnlock()
 
-	for closed := 0; closed < len(p.all); closed++ {
+	allClosed := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(allClosed)
+	}()
+
+	for {
 		select {
-		case conn := <-p.free:
-			err2 := conn.Close()
-			if err == nil {
-				err = err2
+		case conn := <-p.idle:
+			if cErr := conn.Close(); cErr != nil {
+				err = errors.Join(err, cErr)
 			}
+			p.wg.Done()
+		case <-allClosed:
+			return err
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
-	return
 }
 
 type strerror struct {

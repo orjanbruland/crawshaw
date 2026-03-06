@@ -4,7 +4,7 @@ import (
 	"context"
 	"runtime"
 
-	"github.com/go-llsqlite/crawshaw"
+	sqlite "github.com/go-llsqlite/crawshaw"
 )
 
 // GetSnapshot returns a Snapshot that should remain available for reads until
@@ -18,9 +18,9 @@ import (
 //
 // See sqlite.Conn.GetSnapshot and sqlite.Snapshot for more details.
 func (p *Pool) GetSnapshot(ctx context.Context, schema string) (*sqlite.Snapshot, error) {
-	conn := p.Get(ctx)
-	if conn == nil {
-		return nil, context.Canceled
+	conn, err := p.Get(ctx)
+	if err != nil {
+		return nil, err
 	}
 	conn.SetInterrupt(nil)
 	s, release, err := conn.GetSnapshot(schema)

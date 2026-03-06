@@ -12,7 +12,7 @@ A utility package, [sqlitex](https://pkg.go.dev/github.com/go-llsqlite/llsqlite/
 
 This is not a database/sql driver.
 
-```go get -u github.com/go-llsqlite/llsqlite```
+`go get -u github.com/go-llsqlite/llsqlite`
 
 ## Example
 
@@ -32,8 +32,8 @@ func main() {
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
-	conn := dbpool.Get(r.Context())
-	if conn == nil {
+	conn, err := dbpool.Get(r.Context())
+	if err != nil {
 		return
 	}
 	defer dbpool.Put(conn)
