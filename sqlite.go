@@ -20,6 +20,7 @@ package sqlite
 import (
 	"bytes"
 	"runtime"
+	"runtime/cgo"
 	"sync"
 	"time"
 	"unsafe"
@@ -56,9 +57,91 @@ import (
 #cgo freebsd CFLAGS: -std=c99
 // !!! UPDATE THE Makefile WITH THESE DEFINES !!!
 
+#cgo noescape sqlite3_bind_int64
+#cgo noescape sqlite3_bind_double
+#cgo noescape sqlite3_bind_null
+#cgo noescape sqlite3_bind_zeroblob
+#cgo noescape sqlite3_bind_zeroblob64
+#cgo noescape sqlite3_bind_text
+#cgo noescape sqlite3_bind_parameter_count
+#cgo noescape sqlite3_bind_parameter_name
+#cgo noescape sqlite3_clear_bindings
+#cgo noescape sqlite3_column_int
+#cgo noescape sqlite3_column_int64
+#cgo noescape sqlite3_column_double
+#cgo noescape sqlite3_column_text
+#cgo noescape sqlite3_column_blob
+#cgo noescape sqlite3_column_bytes
+#cgo noescape sqlite3_column_type
+#cgo noescape sqlite3_column_count
+#cgo noescape sqlite3_column_name
+#cgo noescape sqlite3_column_database_name
+#cgo noescape sqlite3_column_table_name
+#cgo noescape sqlite3_changes
+#cgo noescape sqlite3_last_insert_rowid
+#cgo noescape sqlite3_errmsg
+#cgo noescape sqlite3_extended_errcode
+#cgo noescape sqlite3_finalize
+#cgo noescape sqlite3_reset
+#cgo noescape sqlite3_prepare_v3
+#cgo noescape transient_bind_blob
+#cgo noescape db_config_onoff
+#cgo noescape sqlite3_blob_read
+#cgo noescape sqlite3_blob_write
+#cgo noescape sqlite3_blob_close
+#cgo noescape sqlite3_blob_bytes
+#cgo noescape sqlite3_blob_reopen
+#cgo noescape sqlite3_blob_open
+#cgo noescape sqlite3_backup_init
+#cgo noescape sqlite3_backup_step
+#cgo noescape sqlite3_backup_finish
+#cgo noescape sqlite3_backup_remaining
+#cgo noescape sqlite3_backup_pagecount
+
+#cgo nocallback sqlite3_bind_int64
+#cgo nocallback sqlite3_bind_double
+#cgo nocallback sqlite3_bind_null
+#cgo nocallback sqlite3_bind_zeroblob
+#cgo nocallback sqlite3_bind_zeroblob64
+#cgo nocallback sqlite3_bind_text
+#cgo nocallback sqlite3_bind_parameter_count
+#cgo nocallback sqlite3_bind_parameter_name
+#cgo nocallback sqlite3_clear_bindings
+#cgo nocallback sqlite3_column_int
+#cgo nocallback sqlite3_column_int64
+#cgo nocallback sqlite3_column_double
+#cgo nocallback sqlite3_column_text
+#cgo nocallback sqlite3_column_blob
+#cgo nocallback sqlite3_column_bytes
+#cgo nocallback sqlite3_column_type
+#cgo nocallback sqlite3_column_count
+#cgo nocallback sqlite3_column_name
+#cgo nocallback sqlite3_column_database_name
+#cgo nocallback sqlite3_column_table_name
+#cgo nocallback sqlite3_changes
+#cgo nocallback sqlite3_last_insert_rowid
+#cgo nocallback sqlite3_errmsg
+#cgo nocallback sqlite3_extended_errcode
+#cgo nocallback sqlite3_finalize
+#cgo nocallback sqlite3_reset
+#cgo nocallback transient_bind_blob
+#cgo nocallback db_config_onoff
+#cgo nocallback sqlite3_blob_read
+#cgo nocallback sqlite3_blob_write
+#cgo nocallback sqlite3_blob_close
+#cgo nocallback sqlite3_blob_bytes
+#cgo nocallback sqlite3_blob_reopen
+#cgo nocallback sqlite3_blob_open
+#cgo nocallback sqlite3_backup_init
+#cgo nocallback sqlite3_backup_step
+#cgo nocallback sqlite3_backup_finish
+#cgo nocallback sqlite3_backup_remaining
+#cgo nocallback sqlite3_backup_pagecount
+
 #include <blocking_step.h>
 // TODO: Note this should include the version that's local to this dir. It might be possible to hook the local version when statically linking it instead.
 #include <sqlite3.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "wrappers.h"
@@ -76,6 +159,10 @@ static void enable_logging() {
 static int db_config_onoff(sqlite3* db, int op, int onoff) {
   return sqlite3_db_config(db, op, onoff, NULL);
 }
+
+static int go_sqlite3_busy_handler(sqlite3* db, int(*xBusy)(void*,int), uintptr_t pArg) {
+  return sqlite3_busy_handler(db, xBusy, (void*)pArg);
+}
 */
 import "C"
 
@@ -83,11 +170,12 @@ import "C"
 //
 // A Conn can only be used by goroutine at a time.
 type Conn struct {
-	conn       *C.sqlite3
-	stmts      map[string]*Stmt // query -> prepared statement
-	authorizer int              // authorizer ID or -1
-	closed     bool
-	count      int // shared variable to help the race detector find Conn misuse
+	conn        *C.sqlite3
+	stmts       map[string]*Stmt // query -> prepared statement
+	authorizer  cgo.Handle       // authorizer handle or 0
+	busyHandler cgo.Handle       // busy handler handle or 0
+	closed      bool
+	count       int // shared variable to help the race detector find Conn misuse
 
 	cancelCh   chan struct{}
 	tracer     Tracer
@@ -133,8 +221,7 @@ func openConn(path string, flags ...OpenFlags) (*Conn, error) {
 		openFlags = OpenFlagsDefault
 	}
 	conn := &Conn{
-		stmts:      make(map[string]*Stmt),
-		authorizer: -1,
+		stmts: make(map[string]*Stmt),
 		// A pointer to unlockNote is retained by C,
 		// so we allocate it on the C heap.
 		unlockNote: C.unlock_note_alloc(),
@@ -329,7 +416,10 @@ func (conn *Conn) SetInterrupt(doneCh <-chan struct{}) (oldDoneCh <-chan struct{
 // https://www.sqlite.org/c3ref/busy_timeout.html
 func (conn *Conn) SetBusyTimeout(d time.Duration) {
 	C.sqlite3_busy_timeout(conn.conn, C.int(d/time.Millisecond))
-	busyHandlers.Delete(conn.conn)
+	if conn.busyHandler != 0 {
+		conn.busyHandler.Delete()
+		conn.busyHandler = 0
+	}
 }
 
 // SetBlockOnBusy sets a busy handler that waits to acquire a lock
@@ -385,28 +475,28 @@ var zombiezenBusyDelays = [...]time.Duration{
 	100 * time.Second,
 }
 
-var busyHandlers sync.Map // sqlite3* -> func(int) bool
-
 func (c *Conn) setBusyHandler(handler func(count int) bool) {
 	if c == nil {
 		return
 	}
 	if handler == nil {
 		C.sqlite3_busy_handler(c.conn, nil, nil)
-		busyHandlers.Delete(c.conn)
+		if c.busyHandler != 0 {
+			c.busyHandler.Delete()
+			c.busyHandler = 0
+		}
 		return
 	}
-	busyHandlers.Store(c.conn, handler)
-	C.sqlite3_busy_handler(c.conn, (*[0]byte)(C.c_goBusyHandlerCallback), unsafe.Pointer(c.conn))
+	if c.busyHandler != 0 {
+		c.busyHandler.Delete()
+	}
+	c.busyHandler = cgo.NewHandle(handler)
+	C.go_sqlite3_busy_handler(c.conn, (*[0]byte)(C.c_goBusyHandlerCallback), C.uintptr_t(c.busyHandler))
 }
 
 //export goBusyHandlerCallback
 func goBusyHandlerCallback(pArg unsafe.Pointer, count C.int) C.int {
-	val, _ := busyHandlers.Load((*C.sqlite3)(pArg))
-	if val == nil {
-		return 0
-	}
-	f := val.(func(int) bool)
+	f := cgo.Handle(uintptr(pArg)).Value().(func(int) bool)
 	if !f(int(count)) {
 		return 0
 	}
@@ -1073,17 +1163,7 @@ func (stmt *Stmt) columnBytes(col int) []byte {
 		return nil
 	}
 	n := stmt.ColumnLen(col)
-
-	slice := struct {
-		data unsafe.Pointer
-		len  int
-		cap  int
-	}{
-		data: unsafe.Pointer(p),
-		len:  n,
-		cap:  n,
-	}
-	return *(*[]byte)(unsafe.Pointer(&slice))
+	return unsafe.Slice((*byte)(p), n)
 }
 
 // ColumnType are codes for each of the SQLite fundamental datatypes:
@@ -1329,8 +1409,8 @@ func sqliteInitFn() {
 func go_log_fn(_ unsafe.Pointer, code C.int, msg *C.char) {
 	var msgBytes []byte
 	if msg != nil {
-		str := C.GoString(msg) // TODO: do not copy msg.
-		msgBytes = []byte(str)
+		n := C.strlen(msg)
+		msgBytes = unsafe.Slice((*byte)(unsafe.Pointer(msg)), n)
 	}
 	Logger(ErrorCode(code), msgBytes)
 }

@@ -1,5 +1,4 @@
 //go:build !linksqlite3
-// +build !linksqlite3
 
 // Package c contains only a C file.
 //

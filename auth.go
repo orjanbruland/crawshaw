@@ -9,10 +9,9 @@ package sqlite
 // }
 import "C"
 import (
-	"errors"
 	"fmt"
+	"runtime/cgo"
 	"strings"
-	"sync"
 )
 
 // An Authorizer is called during statement preparation to see whether an action
@@ -25,7 +24,7 @@ type Authorizer interface {
 // SetAuthorizer(nil) clears any authorizer previously set.
 func (conn *Conn) SetAuthorizer(auth Authorizer) error {
 	if auth == nil {
-		if conn.authorizer == -1 {
+		if conn.authorizer == 0 {
 			return nil
 		}
 		conn.releaseAuthorizer()
@@ -33,44 +32,25 @@ func (conn *Conn) SetAuthorizer(auth Authorizer) error {
 		return reserr("SetAuthorizer", "", "", res)
 	}
 
-	authFuncs.mu.Lock()
-	id := authFuncs.next
-	next := authFuncs.next + 1
-	if next < 0 {
-		authFuncs.mu.Unlock()
-		return errors.New("sqlite: authorizer function id overflow")
-	}
-	authFuncs.next = next
-	authFuncs.m[id] = auth
-	authFuncs.mu.Unlock()
+	conn.releaseAuthorizer()
+	h := cgo.NewHandle(auth)
+	conn.authorizer = h
 
-	res := C.sqlite3_go_set_authorizer(conn.conn, C.uintptr_t(id))
+	res := C.sqlite3_go_set_authorizer(conn.conn, C.uintptr_t(h))
 	return reserr("SetAuthorizer", "", "", res)
 }
 
 func (conn *Conn) releaseAuthorizer() {
-	if conn.authorizer == -1 {
+	if conn.authorizer == 0 {
 		return
 	}
-	authFuncs.mu.Lock()
-	delete(authFuncs.m, conn.authorizer)
-	authFuncs.mu.Unlock()
-	conn.authorizer = -1
-}
-
-var authFuncs = struct {
-	mu   sync.RWMutex
-	m    map[int]Authorizer
-	next int
-}{
-	m: make(map[int]Authorizer),
+	conn.authorizer.Delete()
+	conn.authorizer = 0
 }
 
 //export go_sqlite_auth_tramp
 func go_sqlite_auth_tramp(id uintptr, action C.int, cArg1, cArg2 *C.char, cDB *C.char, cTrigger *C.char) C.int {
-	authFuncs.mu.RLock()
-	auth := authFuncs.m[int(id)]
-	authFuncs.mu.RUnlock()
+	auth := cgo.Handle(id).Value().(Authorizer)
 	var arg1, arg2, database, trigger string
 	if cArg1 != nil {
 		arg1 = C.GoString(cArg1)

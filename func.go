@@ -43,7 +43,7 @@ package sqlite
 // }
 import "C"
 import (
-	"sync"
+	"runtime/cgo"
 	"unsafe"
 )
 
@@ -111,21 +111,12 @@ func (v Value) Blob() []byte {
 }
 
 type xfunc struct {
-	id     int
 	name   string
 	conn   *Conn
 	xFunc  func(Context, ...Value)
 	xStep  func(Context, ...Value)
 	xFinal func(Context)
 	data   interface{}
-}
-
-var xfuncs = struct {
-	mu   sync.RWMutex
-	m    map[int]*xfunc
-	next int
-}{
-	m: make(map[int]*xfunc),
 }
 
 // CreateFunction registers a Go function with SQLite
@@ -156,13 +147,7 @@ func (conn *Conn) CreateFunction(name string, deterministic bool, numArgs int, x
 		xFinal: xFinal,
 	}
 
-	xfuncs.mu.Lock()
-	xfuncs.next++
-	x.id = xfuncs.next
-	xfuncs.m[x.id] = x
-	xfuncs.mu.Unlock()
-
-	pApp := C.uintptr_t(x.id)
+	pApp := C.uintptr_t(cgo.NewHandle(x))
 
 	var funcfn, stepfn, finalfn *[0]byte
 	if xFunc == nil {
@@ -187,13 +172,7 @@ func (conn *Conn) CreateFunction(name string, deterministic bool, numArgs int, x
 }
 
 func getxfuncs(ctx *C.sqlite3_context) *xfunc {
-	id := int(uintptr(C.sqlite3_user_data(ctx)))
-
-	xfuncs.mu.RLock()
-	x := xfuncs.m[id]
-	xfuncs.mu.RUnlock()
-
-	return x
+	return cgo.Handle(uintptr(C.sqlite3_user_data(ctx))).Value().(*xfunc)
 }
 
 //export go_func_tramp
@@ -201,7 +180,7 @@ func go_func_tramp(ctx *C.sqlite3_context, n C.int, valarray **C.sqlite3_value) 
 	x := getxfuncs(ctx)
 	var vals []Value
 	if n > 0 {
-		vals = (*[127]Value)(unsafe.Pointer(valarray))[:n:n]
+		vals = unsafe.Slice((*Value)(unsafe.Pointer(valarray)), n)
 	}
 	x.xFunc(Context{ptr: ctx}, vals...)
 }
@@ -211,7 +190,7 @@ func go_step_tramp(ctx *C.sqlite3_context, n C.int, valarray **C.sqlite3_value) 
 	x := getxfuncs(ctx)
 	var vals []Value
 	if n > 0 {
-		vals = (*[127]Value)(unsafe.Pointer(valarray))[:n:n]
+		vals = unsafe.Slice((*Value)(unsafe.Pointer(valarray)), n)
 	}
 	x.xStep(Context{ptr: ctx}, vals...)
 }
@@ -224,9 +203,5 @@ func go_final_tramp(ctx *C.sqlite3_context) {
 
 //export go_destroy_tramp
 func go_destroy_tramp(ptr uintptr) {
-	id := int(ptr)
-
-	xfuncs.mu.Lock()
-	delete(xfuncs.m, id)
-	xfuncs.mu.Unlock()
+	cgo.Handle(ptr).Delete()
 }

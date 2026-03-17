@@ -113,7 +113,7 @@ import "C"
 import (
 	"io"
 	"runtime"
-	"sync"
+	"runtime/cgo"
 	"unsafe"
 )
 
@@ -269,11 +269,7 @@ func (conn *Conn) changesetApply(r io.Reader,
 		conflictFn: conflictFn,
 	}
 
-	xapplys.mu.Lock()
-	xapplys.next++
-	x.id = xapplys.next
-	xapplys.m[x.id] = x
-	xapplys.mu.Unlock()
+	h := cgo.NewHandle(x)
 
 	var filterTramp, conflictTramp *[0]byte
 	if x.filterFn != nil {
@@ -288,7 +284,7 @@ func (conn *Conn) changesetApply(r io.Reader,
 		flags = C.SQLITE_CHANGESETAPPLY_INVERT
 	}
 
-	pCtx := (C.uintptr_t)(x.id)
+	pCtx := C.uintptr_t(h)
 	res := C.go_sqlite3changeset_apply_v2_strm(conn.conn,
 		(*[0]byte)(C.c_strm_r_tramp),
 		xIn.cptr(),
@@ -297,10 +293,7 @@ func (conn *Conn) changesetApply(r io.Reader,
 		nil, nil,
 		flags)
 
-	xapplys.mu.Lock()
-	delete(xapplys.m, x.id)
-	xapplys.mu.Unlock()
-
+	h.Delete()
 	xIn.free()
 
 	return conn.reserr("Conn.ChangesetApply", "", res)
@@ -487,7 +480,7 @@ func (iter ChangesetIter) PK() ([]bool, error) {
 	if err := reserr("ChangesetIter.PK", "", "", res); err != nil {
 		return nil, err
 	}
-	vals := (*[127]byte)(unsafe.Pointer(pabPK))[:pnCol:pnCol]
+	vals := unsafe.Slice((*byte)(unsafe.Pointer(pabPK)), pnCol)
 	cols := make([]bool, pnCol)
 	for i, val := range vals {
 		if val != 0 {
@@ -710,53 +703,33 @@ func (cg Changegroup) Output(w io.Writer) (n int, err error) {
 }
 
 type strm struct {
-	id int
-	w  io.Writer // one of w or r is set
-	r  io.Reader
-	n  int // number of bytes read or written
-}
-
-var strms = struct {
-	mu   sync.RWMutex
-	m    map[int]*strm
-	next int
-}{
-	m: make(map[int]*strm),
+	handle cgo.Handle
+	w      io.Writer // one of w or r is set
+	r      io.Reader
+	n      int // number of bytes read or written
 }
 
 func newStrm(w io.Writer, r io.Reader) *strm {
 	x := &strm{w: w, r: r}
-
-	strms.mu.Lock()
-	strms.next++
-	x.id = strms.next
-	strms.m[x.id] = x
-	strms.mu.Unlock()
-
+	x.handle = cgo.NewHandle(x)
 	return x
 }
 
-func (x strm) free() {
-	strms.mu.Lock()
-	delete(strms.m, x.id)
-	strms.mu.Unlock()
+func (x *strm) free() {
+	x.handle.Delete()
 }
 
-func (x *strm) cptr() C.uintptr_t { return (C.uintptr_t)(x.id) }
+func (x *strm) cptr() C.uintptr_t { return C.uintptr_t(x.handle) }
 
 func getStrm(cptr uintptr) *strm {
-	strms.mu.RLock()
-	x := strms.m[int(cptr)]
-	strms.mu.RUnlock()
-
-	return x
+	return cgo.Handle(cptr).Value().(*strm)
 }
 
 //export go_strm_w_tramp
 func go_strm_w_tramp(pOut uintptr, pData *C.char, n C.int) C.int {
 	//println("go_strm_w_tramp start")
 	x := getStrm(pOut)
-	b := (*[1 << 30]byte)(unsafe.Pointer(pData))[:n:n]
+	b := unsafe.Slice((*byte)(unsafe.Pointer(pData)), n)
 	for len(b) > 0 {
 		nw, err := x.w.Write(b)
 		x.n += nw
@@ -776,7 +749,7 @@ func go_strm_w_tramp(pOut uintptr, pData *C.char, n C.int) C.int {
 //export go_strm_r_tramp
 func go_strm_r_tramp(pIn uintptr, pData *C.char, pnData *C.int) C.int {
 	x := getStrm(pIn)
-	b := (*[1 << 30]byte)(unsafe.Pointer(pData))[:*pnData:*pnData]
+	b := unsafe.Slice((*byte)(unsafe.Pointer(pData)), *pnData)
 
 	var n int
 	var err error
@@ -802,32 +775,14 @@ func go_strm_r_tramp(pIn uintptr, pData *C.char, pnData *C.int) C.int {
 }
 
 type xapply struct {
-	id         int
 	conn       *Conn
 	filterFn   func(string) bool
 	conflictFn func(ConflictType, ChangesetIter) ConflictAction
 }
 
-var xapplys = struct {
-	mu   sync.RWMutex
-	m    map[int]*xapply
-	next int
-}{
-	m: make(map[int]*xapply),
-}
-
 //export go_xapply_filter_tramp
 func go_xapply_filter_tramp(pCtx uintptr, zTab *C.char) C.int {
-	xapplys.mu.Lock()
-	x, ok := xapplys.m[int(pCtx)]
-	xapplys.mu.Unlock()
-
-	if !ok {
-		panic("not ok")
-	}
-	if x == nil {
-		panic("x == nil")
-	}
+	x := cgo.Handle(pCtx).Value().(*xapply)
 
 	tableName := C.GoString(zTab)
 	if x.filterFn(tableName) {
@@ -838,9 +793,7 @@ func go_xapply_filter_tramp(pCtx uintptr, zTab *C.char) C.int {
 
 //export go_xapply_conflict_tramp
 func go_xapply_conflict_tramp(pCtx uintptr, eConflict C.int, p *C.sqlite3_changeset_iter) C.int {
-	xapplys.mu.Lock()
-	x := xapplys.m[int(pCtx)]
-	xapplys.mu.Unlock()
+	x := cgo.Handle(pCtx).Value().(*xapply)
 
 	action := x.conflictFn(ConflictType(eConflict), ChangesetIter{ptr: p})
 	return C.int(action)
