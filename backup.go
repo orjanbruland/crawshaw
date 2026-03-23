@@ -90,7 +90,7 @@ func setCDB(db string, cdb **C.char) func() {
 		return func() {}
 	}
 	*cdb = C.CString(db)
-	return func() { C.free(unsafe.Pointer(cdb)) }
+	return func() { C.free(unsafe.Pointer(*cdb)) }
 }
 
 // Step is called one or more times to transfer nPage pages at a time between
@@ -98,13 +98,18 @@ func setCDB(db string, cdb **C.char) func() {
 //
 // Use -1 to transfer the entire database at once.
 //
+// For incremental backups, use Remaining to check whether the backup is
+// complete after each call to Step.
+//
 // https://www.sqlite.org/c3ref/backup_finish.html#sqlite3backupstep
 func (b *Backup) Step(nPage int) error {
 	res := C.sqlite3_backup_step(b.ptr, C.int(nPage))
-	if res != C.SQLITE_DONE {
+	switch res {
+	case C.SQLITE_DONE, C.SQLITE_OK:
+		return nil
+	default:
 		return reserr("Backup.Step", "", "", res)
 	}
-	return nil
 }
 
 // Finish is called to clean up the resources allocated by BackupInit.
@@ -113,7 +118,12 @@ func (b *Backup) Step(nPage int) error {
 func (b *Backup) Finish() error {
 	res := C.sqlite3_backup_finish(b.ptr)
 	b.ptr = nil
-	return reserr("Backup.Finish", "", "", res)
+	switch res {
+	case C.SQLITE_OK, C.SQLITE_DONE:
+		return nil
+	default:
+		return reserr("Backup.Finish", "", "", res)
+	}
 }
 
 // Remaining returns the number of pages still to be backed up at the

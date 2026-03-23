@@ -53,11 +53,17 @@ func TestBackup(t *testing.T) {
 		t.Fatalf("expected 2 rows but found %v", count)
 	}
 	c2, err := sqlitex.ResultInt(copyConn.Prep(`SELECT c2 FROM t WHERE c1 = 1;`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if c2 != 2 {
 		t.Fatalf("expected row1 c2 to be 2 but found %v", c2)
 	}
 
 	c2, err = sqlitex.ResultInt(copyConn.Prep(`SELECT c2 FROM t WHERE c1 = 2;`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if c2 != 4 {
 		t.Fatalf("expected row2 c2 to be 4 but found %v", c2)
 	}
