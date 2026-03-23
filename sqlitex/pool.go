@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"runtime/trace"
 	"sync"
+	"time"
 
 	sqlite "github.com/go-llsqlite/crawshaw"
 )
@@ -60,7 +61,8 @@ type Pool struct {
 	idle   chan *sqlite.Conn
 	closed chan struct{}
 
-	all map[*sqlite.Conn]context.CancelFunc
+	all       map[*sqlite.Conn]context.CancelFunc
+	createdAt map[*sqlite.Conn]time.Time
 
 	mu sync.RWMutex
 }
@@ -136,6 +138,12 @@ type PoolConfig struct {
 	// do not run INSERT in any of the initScripts or else it may create duplicate
 	// data unintentionally or fail.
 	InitScript string
+
+	// ConnMaxLifetime sets the maximum amount of time a connection may be reused.
+	// If a connection's age exceeds this value when returned to the pool, it is closed
+	// instead of being returned to the idle pool.
+	// If ConnMaxLifetime is zero or negative, connections are not closed based on age.
+	ConnMaxLifetime time.Duration
 }
 
 // OpenConfig opens a pool of SQLite connections with the provided configuration.
@@ -167,6 +175,7 @@ func OpenConfig(ctx context.Context, config PoolConfig) (pool *Pool, err error) 
 		idle:       make(chan *sqlite.Conn, config.MaxIdleConns),
 		closed:     make(chan struct{}),
 		all:        make(map[*sqlite.Conn]context.CancelFunc),
+		createdAt:  make(map[*sqlite.Conn]time.Time),
 	}
 
 	if config.MaxOpenConns > 0 {
@@ -261,6 +270,9 @@ func (p *Pool) Get(ctx context.Context) (conn *sqlite.Conn, err error) {
 
 	p.mu.Lock()
 	p.all[conn] = cancel
+	if newConn {
+		p.createdAt[conn] = time.Now()
+	}
 	p.mu.Unlock()
 
 	return conn, nil
@@ -301,6 +313,24 @@ func (p *Pool) Put(conn *sqlite.Conn) error {
 		<-p.active
 	}
 
+	// Check if connection has exceeded its max lifetime.
+	if p.config.ConnMaxLifetime > 0 {
+		p.mu.RLock()
+		created, ok := p.createdAt[conn]
+		p.mu.RUnlock()
+		if ok && time.Since(created) >= p.config.ConnMaxLifetime {
+			p.mu.Lock()
+			delete(p.all, conn)
+			delete(p.createdAt, conn)
+			p.wg.Done()
+			p.mu.Unlock()
+			if err := conn.Close(); err != nil {
+				return fmt.Errorf("failed to close expired connection: %v", err)
+			}
+			return nil
+		}
+	}
+
 	select {
 	case p.idle <- conn:
 		// Put the connection back into the idle pool if there's room.
@@ -308,6 +338,7 @@ func (p *Pool) Put(conn *sqlite.Conn) error {
 		// If the idle pool is full, close the connection and remove it from the pool.
 		p.mu.Lock()
 		delete(p.all, conn)
+		delete(p.createdAt, conn)
 		p.wg.Done()
 		p.mu.Unlock()
 
@@ -347,6 +378,9 @@ func (p *Pool) Close(ctx context.Context) (err error) {
 	for {
 		select {
 		case conn := <-p.idle:
+			p.mu.Lock()
+			delete(p.createdAt, conn)
+			p.mu.Unlock()
 			if cErr := conn.Close(); cErr != nil {
 				err = errors.Join(err, cErr)
 			}

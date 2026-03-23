@@ -310,3 +310,81 @@ func TestPoolOpenInit(t *testing.T) {
 		}
 	})
 }
+
+func TestPoolConnMaxLifetime(t *testing.T) {
+	t.Run("expired connection is closed on Put", func(t *testing.T) {
+		dbpool, err := sqlitex.OpenConfig(context.Background(), sqlitex.PoolConfig{
+			URI:             poolURI,
+			Flags:           poolFlags,
+			MaxOpenConns:    5,
+			MaxIdleConns:    5,
+			ConnMaxLifetime: 50 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dbpool.Close(t.Context())
+
+		// Get a connection and note its identity.
+		conn1, err := dbpool.Get(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn1Ptr := fmt.Sprintf("%p", conn1)
+
+		// Wait past the lifetime.
+		time.Sleep(100 * time.Millisecond)
+
+		// Put it back — should be closed, not returned to idle.
+		if err := dbpool.Put(conn1); err != nil {
+			t.Fatal(err)
+		}
+
+		// Get another connection — should be a new one since the old one expired.
+		conn2, err := dbpool.Get(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn2Ptr := fmt.Sprintf("%p", conn2)
+		dbpool.Put(conn2)
+
+		if conn1Ptr == conn2Ptr {
+			t.Error("expected a new connection after lifetime expiry, got the same one")
+		}
+	})
+
+	t.Run("connection within lifetime is reused", func(t *testing.T) {
+		dbpool, err := sqlitex.OpenConfig(context.Background(), sqlitex.PoolConfig{
+			URI:             poolURI,
+			Flags:           poolFlags,
+			MaxOpenConns:    5,
+			MaxIdleConns:    5,
+			ConnMaxLifetime: 10 * time.Second,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dbpool.Close(t.Context())
+
+		conn1, err := dbpool.Get(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn1Ptr := fmt.Sprintf("%p", conn1)
+		if err := dbpool.Put(conn1); err != nil {
+			t.Fatal(err)
+		}
+
+		// Get again immediately — should be the same connection.
+		conn2, err := dbpool.Get(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn2Ptr := fmt.Sprintf("%p", conn2)
+		dbpool.Put(conn2)
+
+		if conn1Ptr != conn2Ptr {
+			t.Error("expected the same connection to be reused within lifetime")
+		}
+	})
+}
