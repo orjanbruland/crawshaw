@@ -29,12 +29,7 @@ func (p *Pool) GetSnapshot(ctx context.Context, schema string) (*sqlite.Snapshot
 	}
 
 	snapshotGCd := make(chan struct{})
-	runtime.SetFinalizer(s, nil)
-	runtime.SetFinalizer(s, func(s *sqlite.Snapshot) {
-		// Free the C resources associated with the Snapshot.
-		s.Free()
-		close(snapshotGCd)
-	})
+	runtime.AddCleanup(s, func(done chan struct{}) { close(done) }, snapshotGCd)
 
 	go func() {
 		select {

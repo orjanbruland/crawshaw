@@ -30,7 +30,8 @@ import (
 //
 // https://www.sqlite.org/c3ref/backup_finish.html
 type Backup struct {
-	ptr *C.sqlite3_backup
+	ptr     *C.sqlite3_backup
+	cleanup runtime.Cleanup
 }
 
 // BackupToDB creates a complete backup of the srcDB on the src Conn to a new
@@ -76,11 +77,7 @@ func (src *Conn) BackupInit(srcDB, dstDB string, dst *Conn) (*Backup, error) {
 		res := C.sqlite3_errcode(dst.conn)
 		return nil, dst.extreserr("Conn.BackupInit", "", res)
 	}
-	runtime.SetFinalizer(&b, func(b *Backup) {
-		if b.ptr != nil {
-			panic("open *sqlite.Backup garbage collected, call Finish method")
-		}
-	})
+	b.cleanup = runtime.AddCleanup(&b, panicCleanup, "open *sqlite.Backup garbage collected, call Finish method")
 
 	return &b, nil
 }
@@ -116,6 +113,7 @@ func (b *Backup) Step(nPage int) error {
 //
 // https://www.sqlite.org/c3ref/backup_finish.html#sqlite3backupfinish
 func (b *Backup) Finish() error {
+	b.cleanup.Stop()
 	res := C.sqlite3_backup_finish(b.ptr)
 	b.ptr = nil
 	switch res {

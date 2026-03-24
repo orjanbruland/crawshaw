@@ -123,7 +123,8 @@ import (
 //
 // Equivalent to the sqlite3_session* C object.
 type Session struct {
-	ptr *C.sqlite3_session
+	ptr     *C.sqlite3_session
+	cleanup runtime.Cleanup
 }
 
 // CreateSession creates a new session object.
@@ -143,11 +144,7 @@ func (conn *Conn) CreateSession(db string) (*Session, error) {
 	if err := conn.reserr("Conn.CreateSession", db, res); err != nil {
 		return nil, err
 	}
-	runtime.SetFinalizer(s, func(s *Session) {
-		if s.ptr != nil {
-			panic("open *sqlite.Session garbage collected, call Delete method")
-		}
-	})
+	s.cleanup = runtime.AddCleanup(s, panicCleanup, "open *sqlite.Session garbage collected, call Delete method")
 
 	return s, nil
 }
@@ -156,6 +153,7 @@ func (conn *Conn) CreateSession(db string) (*Session, error) {
 //
 // https://www.sqlite.org/session/sqlite3session_delete.html
 func (s *Session) Delete() {
+	s.cleanup.Stop()
 	C.sqlite3session_delete(s.ptr)
 	s.ptr = nil
 }

@@ -174,6 +174,7 @@ type Conn struct {
 	stmts       map[string]*Stmt // query -> prepared statement
 	authorizer  cgo.Handle       // authorizer handle or 0
 	busyHandler cgo.Handle       // busy handler handle or 0
+	cleanup     runtime.Cleanup
 	closed      bool
 	count       int // shared variable to help the race detector find Conn misuse
 
@@ -249,12 +250,9 @@ func openConn(path string, flags ...OpenFlags) (*Conn, error) {
 
 	// TODO: only if Debug ?
 	_, file, line, _ := runtime.Caller(stackCallerLayers)
-	runtime.SetFinalizer(conn, func(conn *Conn) {
-		if !conn.closed {
-			var buf [20]byte
-			panic(file + ":" + string(itoa(buf[:], int64(line))) + ": *sqlite.Conn for " + path + " garbage collected, call Close method")
-		}
-	})
+	var buf [20]byte
+	msg := file + ":" + string(itoa(buf[:], int64(line))) + ": *sqlite.Conn for " + path + " garbage collected, call Close method"
+	conn.cleanup = runtime.AddCleanup(conn, panicCleanup, msg)
 
 	if openFlags&SQLITE_OPEN_WAL != 0 {
 		// Set timeout for enabling WAL.
@@ -280,6 +278,7 @@ func openConn(path string, flags ...OpenFlags) (*Conn, error) {
 // Close closes the database connection using sqlite3_close and finalizes
 // persistent prepared statements. https://www.sqlite.org/c3ref/close.html
 func (conn *Conn) Close() error {
+	conn.cleanup.Stop()
 	conn.cancelInterrupt()
 	conn.closed = true
 	for _, stmt := range conn.stmts {
@@ -598,11 +597,7 @@ func (conn *Conn) Prepare(query string) (*Stmt, error) {
 func (conn *Conn) PrepareTransient(query string) (stmt *Stmt, trailingBytes int, err error) {
 	stmt, trailingBytes, err = conn.prepare(query, 0)
 	if stmt != nil {
-		runtime.SetFinalizer(stmt, func(stmt *Stmt) {
-			if stmt.conn != nil {
-				panic("open *sqlite.Stmt \"" + query + "\" garbage collected, call Finalize")
-			}
-		})
+		stmt.cleanup = runtime.AddCleanup(stmt, panicCleanup, "open *sqlite.Stmt \""+query+"\" garbage collected, call Finalize")
 	}
 	return stmt, trailingBytes, err
 }
@@ -703,6 +698,8 @@ func reserr(loc, query, msg string, res C.int) error {
 	return nil
 }
 
+func panicCleanup(msg string) { panic(msg) }
+
 // Stmt is an SQLite3 prepared statement.
 //
 // A Stmt is attached to a particular Conn
@@ -718,6 +715,7 @@ type Stmt struct {
 	bindIndex     map[string]int
 	colNames      map[string]int
 	bindErr       error
+	cleanup       runtime.Cleanup
 	prepInterrupt bool // set if Prep was interrupted
 	lastHasRow    bool // last bool returned by Step
 	tracerTask    TracerTask
@@ -740,6 +738,7 @@ func (stmt *Stmt) interrupted(loc string) error {
 //
 // https://www.sqlite.org/c3ref/finalize.html
 func (stmt *Stmt) Finalize() error {
+	stmt.cleanup.Stop()
 	stmt.conn.count++
 	if ptr := stmt.conn.stmts[stmt.query]; ptr == stmt {
 		delete(stmt.conn.stmts, stmt.query)

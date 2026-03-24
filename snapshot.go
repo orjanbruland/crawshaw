@@ -29,8 +29,9 @@ import (
 //
 // https://www.sqlite.org/c3ref/snapshot.html
 type Snapshot struct {
-	ptr    *C.sqlite3_snapshot
-	schema *C.char
+	ptr     *C.sqlite3_snapshot
+	schema  *C.char
+	cleanup runtime.Cleanup
 }
 
 // GetSnapshot attempts to make a new Snapshot that records the current state
@@ -99,8 +100,9 @@ func (conn *Conn) GetSnapshot(schema string) (*Snapshot, func(), error) {
 		return nil, nil, reserr("Conn.CreateSnapshot", "", "", res)
 	}
 
-	runtime.SetFinalizer(&s, func(s *Snapshot) {
-		s.Free()
+	s.cleanup = runtime.AddCleanup(&s, freeSnapshotCleanup, snapshotCleanupArg{
+		ptr:    s.ptr,
+		schema: s.schema,
 	})
 
 	return &s, endRead, nil
@@ -121,11 +123,24 @@ func (s *Snapshot) Free() {
 	if s.ptr == nil {
 		return
 	}
+	s.cleanup.Stop()
 	C.sqlite3_snapshot_free(s.ptr)
 	if s.schema != cmain {
 		C.free(unsafe.Pointer(s.schema))
 	}
 	s.ptr = nil
+}
+
+type snapshotCleanupArg struct {
+	ptr    *C.sqlite3_snapshot
+	schema *C.char
+}
+
+func freeSnapshotCleanup(arg snapshotCleanupArg) {
+	C.sqlite3_snapshot_free(arg.ptr)
+	if arg.schema != cmain {
+		C.free(unsafe.Pointer(arg.schema))
+	}
 }
 
 // CompareAges returns whether s1 is older, newer or the same age as s2. Age
