@@ -388,3 +388,72 @@ func TestPoolConnMaxLifetime(t *testing.T) {
 		}
 	})
 }
+
+func TestPoolInitScriptPragma(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	dbpool, err := sqlitex.OpenConfig(ctx, sqlitex.PoolConfig{
+		URI:          "file:" + dbPath,
+		Flags:        sqlite.SQLITE_OPEN_READWRITE | sqlite.SQLITE_OPEN_CREATE | sqlite.SQLITE_OPEN_URI,
+		MaxOpenConns: 2,
+		InitScript:   "PRAGMA journal_mode=wal; PRAGMA synchronous=NORMAL;",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbpool.Close(ctx)
+
+	conn, err := dbpool.Get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbpool.Put(conn)
+
+	// Verify PRAGMA synchronous took effect (NORMAL = 1).
+	stmt := conn.Prep("PRAGMA synchronous;")
+	if hasRow, err := stmt.Step(); err != nil {
+		t.Fatal(err)
+	} else if !hasRow {
+		t.Fatal("expected a row from PRAGMA synchronous")
+	}
+	got := stmt.ColumnInt(0)
+	stmt.Reset()
+	if got != 1 {
+		t.Fatalf("PRAGMA synchronous: got %d, want 1 (NORMAL)", got)
+	}
+}
+
+func TestPoolInitScriptEdgeCases(t *testing.T) {
+	tests := []struct {
+		name       string
+		initScript string
+	}{
+		{"empty", ""},
+		{"whitespace", "   \n\t  "},
+		{"single statement", "PRAGMA cache_size=1000;"},
+		{"multiple statements", "PRAGMA cache_size=1000; PRAGMA temp_store=MEMORY;"},
+		{"trailing whitespace", "PRAGMA cache_size=1000;   \n  "},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			dbpool, err := sqlitex.OpenConfig(ctx, sqlitex.PoolConfig{
+				URI:          poolURI,
+				Flags:        poolFlags,
+				MaxOpenConns: 1,
+				InitScript:   tt.initScript,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dbpool.Close(ctx)
+
+			conn, err := dbpool.Get(ctx)
+			if err != nil {
+				t.Fatalf("Get failed: %v", err)
+			}
+			dbpool.Put(conn)
+		})
+	}
+}

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/trace"
+	"strings"
 	"sync"
 	"time"
 
@@ -258,7 +259,7 @@ func (p *Pool) Get(ctx context.Context) (conn *sqlite.Conn, err error) {
 	conn.SetInterrupt(ctx.Done())
 
 	if newConn && p.config.InitScript != "" {
-		if err := ExecScript(conn, p.config.InitScript); err != nil {
+		if err := execInitScript(conn, p.config.InitScript); err != nil {
 			conn.Close()
 			return nil, err
 		}
@@ -452,4 +453,35 @@ func (t *tracerTask) EndRegion() {
 
 func (t *tracerTask) End() {
 	t.task.End()
+}
+
+// execInitScript executes each statement in the script individually, without
+// wrapping them in a transaction. This is necessary because certain PRAGMA
+// statements (e.g. synchronous) cannot be changed inside a transaction.
+func execInitScript(conn *sqlite.Conn, script string) error {
+	for {
+		script = strings.TrimSpace(script)
+		if script == "" {
+			break
+		}
+		stmt, trailingBytes, err := conn.PrepareTransient(script)
+		if err != nil {
+			return err
+		}
+		usedBytes := len(script) - trailingBytes
+		if usedBytes == 0 {
+			// No SQL was consumed. Break to guarantee loop termination.
+			stmt.Finalize()
+			break
+		}
+		_, err = stmt.Step()
+		if err2 := stmt.Finalize(); err == nil {
+			err = err2
+		}
+		if err != nil {
+			return err
+		}
+		script = script[usedBytes:]
+	}
+	return nil
 }
