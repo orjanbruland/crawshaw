@@ -63,6 +63,7 @@ import (
 #cgo noescape sqlite3_bind_zeroblob
 #cgo noescape sqlite3_bind_zeroblob64
 #cgo noescape sqlite3_bind_text
+#cgo noescape sqlite3_bind_pointer
 #cgo noescape sqlite3_bind_parameter_count
 #cgo noescape sqlite3_bind_parameter_name
 #cgo noescape sqlite3_clear_bindings
@@ -104,6 +105,7 @@ import (
 #cgo nocallback sqlite3_bind_zeroblob
 #cgo nocallback sqlite3_bind_zeroblob64
 #cgo nocallback sqlite3_bind_text
+#cgo nocallback sqlite3_bind_pointer
 #cgo nocallback sqlite3_bind_parameter_count
 #cgo nocallback sqlite3_bind_parameter_name
 #cgo nocallback sqlite3_clear_bindings
@@ -1017,6 +1019,47 @@ func (stmt *Stmt) BindText(param int, value string) {
 	}
 	res := C.sqlite3_bind_text(stmt.stmt, C.int(param), v, C.int(len(value)), free)
 	stmt.handleBindErr("BindText", res)
+}
+
+// pointerTypes caches C strings for sqlite3_bind_pointer type parameters.
+// sqlite3_bind_pointer stores the type string pointer directly (does not copy it),
+// so the C string must remain valid for the lifetime of the statement.
+// In practice there are only a handful of distinct types (e.g. "carray").
+var pointerTypes sync.Map // map[string]*C.char
+
+func pointerTypeCStr(ptype string) *C.char {
+	if v, ok := pointerTypes.Load(ptype); ok {
+		return v.(*C.char)
+	}
+	cs := C.CString(ptype)
+	if actual, loaded := pointerTypes.LoadOrStore(ptype, cs); loaded {
+		C.free(unsafe.Pointer(cs))
+		return actual.(*C.char)
+	}
+	return cs
+}
+
+// BindPointer binds a pointer value to a numbered stmt parameter using the
+// pointer-passing interface.
+//
+// Parameter indices start at 1.
+//
+// https://www.sqlite.org/bindptr.html
+func (stmt *Stmt) BindPointer(param int, ptr unsafe.Pointer, ptype string) {
+	if stmt.stmt == nil {
+		return
+	}
+	cptype := pointerTypeCStr(ptype)
+	res := C.sqlite3_bind_pointer(stmt.stmt, C.int(param), ptr, cptype, nil)
+	stmt.handleBindErr("BindPointer", res)
+}
+
+// PointerArg is used with ExecOptions.Args to bind a pointer parameter
+// via sqlite3_bind_pointer. Set Pointer to the C pointer value and Type
+// to the pointer type string expected by the receiving extension.
+type PointerArg struct {
+	Pointer unsafe.Pointer
+	Type    string
 }
 
 // BindFloat binds value to a numbered stmt parameter.

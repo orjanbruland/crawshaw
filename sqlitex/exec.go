@@ -311,6 +311,14 @@ func exec(stmt *sqlite.Stmt, flags uint8, opts *ExecOptions) (err error) {
 }
 
 func setArg(stmt *sqlite.Stmt, i int, v reflect.Value) {
+	// Handle PointerArg before the reflect Kind switch, since it is a struct
+	// and would otherwise fall through to the default text-formatting branch.
+	if v.IsValid() && v.CanInterface() {
+		if pa, ok := v.Interface().(sqlite.PointerArg); ok {
+			stmt.BindPointer(i, pa.Pointer, pa.Type)
+			return
+		}
+	}
 	switch v.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		stmt.BindInt64(i, v.Int())
