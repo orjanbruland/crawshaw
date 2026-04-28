@@ -423,6 +423,244 @@ func TestPoolInitScriptPragma(t *testing.T) {
 	}
 }
 
+func TestPoolStats(t *testing.T) {
+	t.Run("counts in-use and idle", func(t *testing.T) {
+		dbpool, err := sqlitex.OpenConfig(context.Background(), sqlitex.PoolConfig{
+			URI:          poolURI,
+			Flags:        poolFlags,
+			MaxOpenConns: 5,
+			MaxIdleConns: 5,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dbpool.Close(t.Context())
+
+		if got := dbpool.Stats(); got.OpenConnections != 0 || got.InUse != 0 || got.Idle != 0 {
+			t.Fatalf("initial stats = %+v, want all zero", got)
+		}
+		if got := dbpool.Stats().MaxOpenConnections; got != 5 {
+			t.Errorf("MaxOpenConnections = %d, want 5", got)
+		}
+
+		conns := make([]*sqlite.Conn, 3)
+		for i := range conns {
+			c, err := dbpool.Get(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conns[i] = c
+		}
+
+		got := dbpool.Stats()
+		if got.OpenConnections != 3 || got.InUse != 3 || got.Idle != 0 {
+			t.Errorf("after 3 Gets: stats = %+v, want Open=3 InUse=3 Idle=0", got)
+		}
+
+		for _, c := range conns {
+			if err := dbpool.Put(c); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		got = dbpool.Stats()
+		if got.OpenConnections != 3 || got.InUse != 0 || got.Idle != 3 {
+			t.Errorf("after 3 Puts: stats = %+v, want Open=3 InUse=0 Idle=3", got)
+		}
+	})
+
+	t.Run("WaitCount and WaitDuration", func(t *testing.T) {
+		dbpool, err := sqlitex.OpenConfig(context.Background(), sqlitex.PoolConfig{
+			URI:          poolURI,
+			Flags:        poolFlags,
+			MaxOpenConns: 1,
+			MaxIdleConns: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dbpool.Close(t.Context())
+
+		c1, err := dbpool.Get(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Second Get must block until c1 is returned.
+		gotC2 := make(chan *sqlite.Conn, 1)
+		go func() {
+			c2, err := dbpool.Get(context.Background())
+			if err != nil {
+				t.Errorf("second Get failed: %v", err)
+				gotC2 <- nil
+				return
+			}
+			gotC2 <- c2
+		}()
+
+		// Wait until the goroutine is actually blocked on the pool.
+		deadline := time.Now().Add(time.Second)
+		for dbpool.Stats().WaitCount != 1 {
+			if time.Now().After(deadline) {
+				t.Fatal("second Get did not start waiting")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if err := dbpool.Put(c1); err != nil {
+			t.Fatal(err)
+		}
+
+		c2 := <-gotC2
+		if c2 == nil {
+			t.Fatal("second Get returned nil conn")
+		}
+		dbpool.Put(c2)
+
+		got := dbpool.Stats()
+		if got.WaitCount != 1 {
+			t.Errorf("WaitCount = %d, want 1", got.WaitCount)
+		}
+		if got.WaitDuration <= 0 {
+			t.Errorf("WaitDuration = %v, want > 0", got.WaitDuration)
+		}
+	})
+
+	t.Run("WaitCount and WaitDuration include canceled waits", func(t *testing.T) {
+		dbpool, err := sqlitex.OpenConfig(context.Background(), sqlitex.PoolConfig{
+			URI:          poolURI,
+			Flags:        poolFlags,
+			MaxOpenConns: 1,
+			MaxIdleConns: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dbpool.Close(t.Context())
+
+		c1, err := dbpool.Get(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dbpool.Put(c1)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+
+		c2, err := dbpool.Get(ctx)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Get with timed-out context error = %v, want %v", err, context.DeadlineExceeded)
+		}
+		if c2 != nil {
+			t.Fatal("Get with timed-out context returned non-nil conn")
+		}
+
+		got := dbpool.Stats()
+		if got.WaitCount != 1 {
+			t.Errorf("WaitCount = %d, want 1", got.WaitCount)
+		}
+		if got.WaitDuration <= 0 {
+			t.Errorf("WaitDuration = %v, want > 0", got.WaitDuration)
+		}
+	})
+
+	t.Run("MaxIdleClosed when idle pool full", func(t *testing.T) {
+		dbpool, err := sqlitex.OpenConfig(context.Background(), sqlitex.PoolConfig{
+			URI:          poolURI,
+			Flags:        poolFlags,
+			MaxOpenConns: 3,
+			MaxIdleConns: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dbpool.Close(t.Context())
+
+		conns := make([]*sqlite.Conn, 3)
+		for i := range conns {
+			c, err := dbpool.Get(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conns[i] = c
+		}
+		for _, c := range conns {
+			if err := dbpool.Put(c); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		got := dbpool.Stats()
+		if got.MaxIdleClosed != 2 {
+			t.Errorf("MaxIdleClosed = %d, want 2", got.MaxIdleClosed)
+		}
+		if got.OpenConnections != 1 || got.Idle != 1 {
+			t.Errorf("after Puts: stats = %+v, want Open=1 Idle=1", got)
+		}
+	})
+
+	t.Run("MaxLifetimeClosed", func(t *testing.T) {
+		dbpool, err := sqlitex.OpenConfig(context.Background(), sqlitex.PoolConfig{
+			URI:             poolURI,
+			Flags:           poolFlags,
+			MaxOpenConns:    2,
+			MaxIdleConns:    2,
+			ConnMaxLifetime: 25 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dbpool.Close(t.Context())
+
+		c, err := dbpool.Get(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond)
+		if err := dbpool.Put(c); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := dbpool.Stats(); got.MaxLifetimeClosed != 1 {
+			t.Errorf("MaxLifetimeClosed = %d, want 1", got.MaxLifetimeClosed)
+		}
+	})
+
+	t.Run("Close removes idle connections from stats", func(t *testing.T) {
+		dbpool, err := sqlitex.OpenConfig(context.Background(), sqlitex.PoolConfig{
+			URI:          poolURI,
+			Flags:        poolFlags,
+			MaxOpenConns: 3,
+			MaxIdleConns: 3,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		conns := make([]*sqlite.Conn, 2)
+		for i := range conns {
+			c, err := dbpool.Get(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conns[i] = c
+		}
+		for _, c := range conns {
+			if err := dbpool.Put(c); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if err := dbpool.Close(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		got := dbpool.Stats()
+		if got.OpenConnections != 0 || got.InUse != 0 || got.Idle != 0 {
+			t.Errorf("after Close: stats = %+v, want Open=0 InUse=0 Idle=0", got)
+		}
+	})
+}
+
 func TestPoolInitScriptEdgeCases(t *testing.T) {
 	tests := []struct {
 		name       string

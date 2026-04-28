@@ -21,6 +21,7 @@ import (
 	"runtime/trace"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	sqlite "github.com/go-llsqlite/crawshaw"
@@ -66,6 +67,62 @@ type Pool struct {
 	createdAt map[*sqlite.Conn]time.Time
 
 	mu sync.RWMutex
+
+	waitCount         atomic.Int64
+	waitDurationNs    atomic.Int64
+	maxIdleClosed     atomic.Int64
+	maxLifetimeClosed atomic.Int64
+}
+
+// PoolStats contains statistics about a Pool, mirroring the structure of
+// database/sql.DBStats.
+type PoolStats struct {
+	// MaxOpenConnections is the maximum number of open connections to the database.
+	// Zero indicates no limit.
+	MaxOpenConnections int
+
+	// OpenConnections is the number of established connections both in use and idle.
+	OpenConnections int
+
+	// InUse is the number of connections currently in use.
+	InUse int
+
+	// Idle is the number of idle connections.
+	Idle int
+
+	// WaitCount is the total number of Get calls that had to wait for a
+	// connection because MaxOpenConnections was reached.
+	WaitCount int64
+
+	// WaitDuration is the total time blocked waiting for a new connection.
+	WaitDuration time.Duration
+
+	// MaxIdleClosed is the total number of connections closed because the
+	// idle pool was full (exceeded MaxIdleConns).
+	MaxIdleClosed int64
+
+	// MaxLifetimeClosed is the total number of connections closed because
+	// they exceeded ConnMaxLifetime.
+	MaxLifetimeClosed int64
+}
+
+// Stats returns statistics about the Pool.
+func (p *Pool) Stats() PoolStats {
+	p.mu.RLock()
+	open := len(p.all)
+	p.mu.RUnlock()
+	idle := len(p.idle)
+	inUse := max(open-idle, 0)
+	return PoolStats{
+		MaxOpenConnections: p.config.MaxOpenConns,
+		OpenConnections:    open,
+		InUse:              inUse,
+		Idle:               idle,
+		WaitCount:          p.waitCount.Load(),
+		WaitDuration:       time.Duration(p.waitDurationNs.Load()),
+		MaxIdleClosed:      p.maxIdleClosed.Load(),
+		MaxLifetimeClosed:  p.maxLifetimeClosed.Load(),
+	}
 }
 
 // Open opens a fixed-size pool of SQLite connections.
@@ -228,10 +285,27 @@ func (p *Pool) Get(ctx context.Context) (conn *sqlite.Conn, err error) {
 	if p.active != nil {
 		select {
 		case p.active <- struct{}{}:
+			// Acquired without blocking.
 		case <-p.closed:
 			return nil, ErrPoolClosed
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		default:
+			waitStart := time.Now()
+			p.waitCount.Add(1)
+
+			var waitErr error
+			select {
+			case p.active <- struct{}{}:
+			case <-p.closed:
+				waitErr = ErrPoolClosed
+			case <-ctx.Done():
+				waitErr = ctx.Err()
+			}
+			p.waitDurationNs.Add(int64(time.Since(waitStart)))
+			if waitErr != nil {
+				return nil, waitErr
+			}
 		}
 
 		defer func() {
@@ -325,6 +399,7 @@ func (p *Pool) Put(conn *sqlite.Conn) error {
 			delete(p.createdAt, conn)
 			p.wg.Done()
 			p.mu.Unlock()
+			p.maxLifetimeClosed.Add(1)
 			if err := conn.Close(); err != nil {
 				return fmt.Errorf("failed to close expired connection: %v", err)
 			}
@@ -342,6 +417,7 @@ func (p *Pool) Put(conn *sqlite.Conn) error {
 		delete(p.createdAt, conn)
 		p.wg.Done()
 		p.mu.Unlock()
+		p.maxIdleClosed.Add(1)
 
 		if err := conn.Close(); err != nil {
 			return fmt.Errorf("failed to close connection: %v", err)
@@ -380,6 +456,7 @@ func (p *Pool) Close(ctx context.Context) (err error) {
 		select {
 		case conn := <-p.idle:
 			p.mu.Lock()
+			delete(p.all, conn)
 			delete(p.createdAt, conn)
 			p.mu.Unlock()
 			if cErr := conn.Close(); cErr != nil {
