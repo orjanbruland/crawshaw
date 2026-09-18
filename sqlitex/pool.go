@@ -58,13 +58,14 @@ type Pool struct {
 
 	config PoolConfig
 
-	wg     sync.WaitGroup
-	active chan struct{}
-	idle   chan *sqlite.Conn
-	closed chan struct{}
+	wg         sync.WaitGroup
+	active     chan struct{}
+	idleSignal chan struct{}
+	closed     chan struct{}
 
 	all       map[*sqlite.Conn]context.CancelFunc
 	createdAt map[*sqlite.Conn]time.Time
+	idle      []idleConn
 
 	mu sync.RWMutex
 
@@ -72,6 +73,12 @@ type Pool struct {
 	waitDurationNs    atomic.Int64
 	maxIdleClosed     atomic.Int64
 	maxLifetimeClosed atomic.Int64
+	maxIdleTimeClosed atomic.Int64
+}
+
+type idleConn struct {
+	conn      *sqlite.Conn
+	idleSince time.Time
 }
 
 // PoolStats contains statistics about a Pool, mirroring the structure of
@@ -104,14 +111,18 @@ type PoolStats struct {
 	// MaxLifetimeClosed is the total number of connections closed because
 	// they exceeded ConnMaxLifetime.
 	MaxLifetimeClosed int64
+
+	// MaxIdleTimeClosed is the total number of connections closed because
+	// they exceeded ConnMaxIdleTime.
+	MaxIdleTimeClosed int64
 }
 
 // Stats returns statistics about the Pool.
 func (p *Pool) Stats() PoolStats {
 	p.mu.RLock()
 	open := len(p.all)
-	p.mu.RUnlock()
 	idle := len(p.idle)
+	p.mu.RUnlock()
 	inUse := max(open-idle, 0)
 	return PoolStats{
 		MaxOpenConnections: p.config.MaxOpenConns,
@@ -122,6 +133,7 @@ func (p *Pool) Stats() PoolStats {
 		WaitDuration:       time.Duration(p.waitDurationNs.Load()),
 		MaxIdleClosed:      p.maxIdleClosed.Load(),
 		MaxLifetimeClosed:  p.maxLifetimeClosed.Load(),
+		MaxIdleTimeClosed:  p.maxIdleTimeClosed.Load(),
 	}
 }
 
@@ -202,6 +214,13 @@ type PoolConfig struct {
 	// instead of being returned to the idle pool.
 	// If ConnMaxLifetime is zero or negative, connections are not closed based on age.
 	ConnMaxLifetime time.Duration
+
+	// ConnMaxIdleTime sets the maximum amount of time a connection may sit
+	// idle in the pool before a background reaper closes it. The reaper wakes
+	// every ConnMaxIdleTime/2.
+	// If ConnMaxIdleTime is zero or negative, idle connections are not closed
+	// based on idle time.
+	ConnMaxIdleTime time.Duration
 }
 
 // OpenConfig opens a pool of SQLite connections with the provided configuration.
@@ -230,7 +249,7 @@ func OpenConfig(ctx context.Context, config PoolConfig) (pool *Pool, err error) 
 	p := &Pool{
 		checkReset: true,
 		config:     config,
-		idle:       make(chan *sqlite.Conn, config.MaxIdleConns),
+		idleSignal: make(chan struct{}, 1),
 		closed:     make(chan struct{}),
 		all:        make(map[*sqlite.Conn]context.CancelFunc),
 		createdAt:  make(map[*sqlite.Conn]time.Time),
@@ -238,6 +257,10 @@ func OpenConfig(ctx context.Context, config PoolConfig) (pool *Pool, err error) 
 
 	if config.MaxOpenConns > 0 {
 		p.active = make(chan struct{}, config.MaxOpenConns)
+	}
+
+	if config.ConnMaxIdleTime > 0 {
+		go p.reapLoop()
 	}
 	return p, nil
 }
@@ -317,11 +340,17 @@ func (p *Pool) Get(ctx context.Context) (conn *sqlite.Conn, err error) {
 	}
 
 	var newConn bool
-	select {
-	case conn = <-p.idle:
-		// Pick a connection from the idle pool if one is available.
-	default:
+	p.mu.Lock()
+	if n := len(p.idle); n > 0 {
+		conn = p.idle[n-1].conn
+		p.idle[n-1] = idleConn{}
+		p.idle = p.idle[:n-1]
+	} else {
 		newConn = true
+	}
+	p.mu.Unlock()
+
+	if newConn {
 		var err error
 		conn, err = sqlite.OpenConn(p.config.URI, p.config.Flags)
 		if err != nil {
@@ -407,21 +436,25 @@ func (p *Pool) Put(conn *sqlite.Conn) error {
 		}
 	}
 
-	select {
-	case p.idle <- conn:
-		// Put the connection back into the idle pool if there's room.
-	default:
-		// If the idle pool is full, close the connection and remove it from the pool.
-		p.mu.Lock()
-		delete(p.all, conn)
-		delete(p.createdAt, conn)
-		p.wg.Done()
+	now := time.Now()
+	p.mu.Lock()
+	if len(p.idle) < p.config.MaxIdleConns {
+		p.idle = append(p.idle, idleConn{conn: conn, idleSince: now})
 		p.mu.Unlock()
-		p.maxIdleClosed.Add(1)
-
-		if err := conn.Close(); err != nil {
-			return fmt.Errorf("failed to close connection: %v", err)
+		select {
+		case p.idleSignal <- struct{}{}:
+		default:
 		}
+		return nil
+	}
+	delete(p.all, conn)
+	delete(p.createdAt, conn)
+	p.wg.Done()
+	p.mu.Unlock()
+	p.maxIdleClosed.Add(1)
+
+	if err := conn.Close(); err != nil {
+		return fmt.Errorf("failed to close connection: %v", err)
 	}
 	return nil
 }
@@ -453,20 +486,32 @@ func (p *Pool) Close(ctx context.Context) (err error) {
 	}()
 
 	for {
-		select {
-		case conn := <-p.idle:
+		for {
 			p.mu.Lock()
-			delete(p.all, conn)
-			delete(p.createdAt, conn)
+			n := len(p.idle)
+			if n == 0 {
+				p.mu.Unlock()
+				break
+			}
+			ic := p.idle[n-1]
+			p.idle[n-1] = idleConn{}
+			p.idle = p.idle[:n-1]
+			delete(p.all, ic.conn)
+			delete(p.createdAt, ic.conn)
 			p.mu.Unlock()
-			if cErr := conn.Close(); cErr != nil {
+			if cErr := ic.conn.Close(); cErr != nil {
 				err = errors.Join(err, cErr)
 			}
 			p.wg.Done()
+		}
+
+		select {
 		case <-allClosed:
 			return err
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-p.idleSignal:
+			// More conns Put back during close; loop to drain.
 		}
 	}
 }
@@ -530,6 +575,54 @@ func (t *tracerTask) EndRegion() {
 
 func (t *tracerTask) End() {
 	t.task.End()
+}
+
+// reapLoop closes idle connections that have been idle longer than
+// p.config.ConnMaxIdleTime. It runs in its own goroutine, started from
+// OpenConfig when ConnMaxIdleTime > 0, and exits when the pool is closed.
+func (p *Pool) reapLoop() {
+	interval := p.config.ConnMaxIdleTime / 2
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.closed:
+			return
+		case <-ticker.C:
+			p.reapIdle()
+		}
+	}
+}
+
+func (p *Pool) reapIdle() {
+	cutoff := time.Now().Add(-p.config.ConnMaxIdleTime)
+	var toClose []*sqlite.Conn
+
+	p.mu.Lock()
+	kept := p.idle[:0]
+	for _, ic := range p.idle {
+		if ic.idleSince.Before(cutoff) {
+			toClose = append(toClose, ic.conn)
+			delete(p.all, ic.conn)
+			delete(p.createdAt, ic.conn)
+			p.wg.Done()
+		} else {
+			kept = append(kept, ic)
+		}
+	}
+	for i := len(kept); i < len(p.idle); i++ {
+		p.idle[i] = idleConn{}
+	}
+	p.idle = kept
+	p.mu.Unlock()
+
+	for _, c := range toClose {
+		_ = c.Close()
+		p.maxIdleTimeClosed.Add(1)
+	}
 }
 
 // execInitScript executes each statement in the script individually, without

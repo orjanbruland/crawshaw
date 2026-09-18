@@ -389,6 +389,92 @@ func TestPoolConnMaxLifetime(t *testing.T) {
 	})
 }
 
+func TestPoolConnMaxIdleTime(t *testing.T) {
+	t.Run("idle reaper closes stale connections", func(t *testing.T) {
+		dbpool, err := sqlitex.OpenConfig(context.Background(), sqlitex.PoolConfig{
+			URI:             poolURI,
+			Flags:           poolFlags,
+			MaxOpenConns:    3,
+			MaxIdleConns:    3,
+			ConnMaxIdleTime: 50 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dbpool.Close(t.Context())
+
+		// Check out and return three conns so they all sit idle.
+		conns := make([]*sqlite.Conn, 3)
+		for i := range conns {
+			c, err := dbpool.Get(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conns[i] = c
+		}
+		for _, c := range conns {
+			if err := dbpool.Put(c); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if got := dbpool.Stats(); got.Idle != 3 {
+			t.Fatalf("after Puts: Idle = %d, want 3", got.Idle)
+		}
+
+		// Wait long enough for the reaper to fire (interval = ConnMaxIdleTime/2).
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if dbpool.Stats().Idle == 0 {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		got := dbpool.Stats()
+		if got.Idle != 0 {
+			t.Errorf("after reaper ran: Idle = %d, want 0", got.Idle)
+		}
+		if got.OpenConnections != 0 {
+			t.Errorf("after reaper ran: OpenConnections = %d, want 0", got.OpenConnections)
+		}
+		if got.MaxIdleTimeClosed < 3 {
+			t.Errorf("MaxIdleTimeClosed = %d, want >= 3", got.MaxIdleTimeClosed)
+		}
+	})
+
+	t.Run("active connection survives reaper", func(t *testing.T) {
+		dbpool, err := sqlitex.OpenConfig(context.Background(), sqlitex.PoolConfig{
+			URI:             poolURI,
+			Flags:           poolFlags,
+			MaxOpenConns:    2,
+			MaxIdleConns:    2,
+			ConnMaxIdleTime: 30 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dbpool.Close(t.Context())
+
+		c, err := dbpool.Get(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Hold the conn longer than the idle timeout. Since it's checked out,
+		// the reaper must not touch it.
+		time.Sleep(150 * time.Millisecond)
+
+		if got := dbpool.Stats(); got.MaxIdleTimeClosed != 0 {
+			t.Errorf("MaxIdleTimeClosed = %d, want 0 (conn is in use)", got.MaxIdleTimeClosed)
+		}
+
+		if err := dbpool.Put(c); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestPoolInitScriptPragma(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
@@ -622,6 +708,40 @@ func TestPoolStats(t *testing.T) {
 
 		if got := dbpool.Stats(); got.MaxLifetimeClosed != 1 {
 			t.Errorf("MaxLifetimeClosed = %d, want 1", got.MaxLifetimeClosed)
+		}
+	})
+
+	t.Run("MaxIdleTimeClosed", func(t *testing.T) {
+		dbpool, err := sqlitex.OpenConfig(context.Background(), sqlitex.PoolConfig{
+			URI:             poolURI,
+			Flags:           poolFlags,
+			MaxOpenConns:    2,
+			MaxIdleConns:    2,
+			ConnMaxIdleTime: 25 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dbpool.Close(t.Context())
+
+		c, err := dbpool.Get(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := dbpool.Put(c); err != nil {
+			t.Fatal(err)
+		}
+
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if dbpool.Stats().MaxIdleTimeClosed >= 1 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		if got := dbpool.Stats(); got.MaxIdleTimeClosed < 1 {
+			t.Errorf("MaxIdleTimeClosed = %d, want >= 1", got.MaxIdleTimeClosed)
 		}
 	})
 
