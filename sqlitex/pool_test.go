@@ -21,6 +21,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -915,6 +916,51 @@ func TestPoolPutRollbackFails(t *testing.T) {
 		t.Errorf("OpenConnections = %d, want 0 after the connection was closed", open)
 	}
 
+	got := getSoon(t, dbpool)
+	if got == conn {
+		t.Fatal("Get returned the connection Put could not roll back")
+	}
+	checkRolledBack(t, dbpool, got)
+	checkWriteLockFree(t, dbPath)
+}
+
+// A statement the caller has not finalized keeps the native connection open
+// after Put fails to roll it back, so it keeps the write lock until the caller
+// finalizes the statement.
+func TestPoolPutRollbackFailsWithOpenStatement(t *testing.T) {
+	dbpool, dbPath := openDirtyTestPool(t)
+
+	conn, err := dbpool.Get(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	beginWrite(t, conn)
+	stmt, _, err := conn.PrepareTransient("SELECT a FROM t;")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = conn.SetAuthorizer(sqlite.AuthorizeFunc(func(info sqlite.ActionInfo) sqlite.AuthResult {
+		if info.Action == sqlite.SQLITE_TRANSACTION && info.Operation == "ROLLBACK" {
+			return sqlite.SQLITE_DENY
+		}
+		return 0
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = dbpool.Put(conn)
+	if !errors.Is(err, sqlitex.ErrDirtyConn) {
+		t.Errorf("Put: got %v, want ErrDirtyConn", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "connection closed") {
+		t.Errorf("Put: got %v, which claims a connection that is still open was closed", err)
+	}
+	t.Logf("Put: %v", err)
+
+	if err := stmt.Finalize(); err != nil {
+		t.Fatal(err)
+	}
 	got := getSoon(t, dbpool)
 	if got == conn {
 		t.Fatal("Get returned the connection Put could not roll back")

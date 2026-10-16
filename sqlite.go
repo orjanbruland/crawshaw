@@ -279,6 +279,11 @@ func openConn(path string, flags ...OpenFlags) (*Conn, error) {
 
 // Close closes the database connection using sqlite3_close and finalizes
 // persistent prepared statements. https://www.sqlite.org/c3ref/close.html
+//
+// If a statement from PrepareTransient is not yet finalized, or a backup is
+// unfinished, Close returns an SQLITE_BUSY error, and SQLite closes the
+// connection once they finish. Until then the connection keeps any open
+// transaction and its locks.
 func (conn *Conn) Close() error {
 	conn.cleanup.Stop()
 	conn.cancelInterrupt()
@@ -287,10 +292,18 @@ func (conn *Conn) Close() error {
 		stmt.Finalize()
 	}
 	res := C.sqlite3_close(conn.conn)
+	var msg string
+	if res == C.SQLITE_BUSY {
+		// sqlite3_close leaves the connection open, holding any transaction
+		// and its locks, and this Conn can no longer close it. close_v2 has
+		// SQLite roll back and close it when the last of them finishes.
+		C.sqlite3_close_v2(conn.conn)
+		msg = "unfinalized statements or unfinished backups; the connection closes once they finish"
+	}
 	C.unlock_note_free(conn.unlockNote)
 	conn.unlockNote = nil
 	conn.releaseAuthorizer()
-	return reserr("Conn.Close", "", "", res)
+	return reserr("Conn.Close", "", msg, res)
 }
 
 func (conn *Conn) GetAutocommit() bool {

@@ -473,11 +473,16 @@ func (p *Pool) cleanDirty(conn *sqlite.Conn) (discarded bool, err error) {
 
 	// Still dirty, so it must not be reused. Get opens a new connection when
 	// needed, as after ConnMaxLifetime expiry.
-	err = fmt.Errorf("%w: %s; connection closed", ErrDirtyConn, what)
+	closeErr := p.closeConn(conn)
+	outcome := "connection closed"
+	if closeErr != nil {
+		outcome = "connection discarded"
+	}
+	err = fmt.Errorf("%w: %s; %s", ErrDirtyConn, what, outcome)
 	if rollbackErr != nil {
 		err = errors.Join(err, fmt.Errorf("rollback failed: %w", rollbackErr))
 	}
-	if closeErr := p.closeConn(conn); closeErr != nil {
+	if closeErr != nil {
 		err = errors.Join(err, fmt.Errorf("failed to close connection: %w", closeErr))
 	}
 	return true, err
@@ -485,7 +490,9 @@ func (p *Pool) cleanDirty(conn *sqlite.Conn) (discarded bool, err error) {
 
 // closeConn removes conn from the pool and closes it. It marks the wait group
 // only once conn.Close returns, so that a concurrent Close cannot return while
-// the connection still holds the database file and its locks.
+// the connection still holds the database file and its locks. A connection
+// that Close leaves for SQLite to close later, once the caller finalizes its
+// statements, is not waited for.
 func (p *Pool) closeConn(conn *sqlite.Conn) error {
 	p.mu.Lock()
 	delete(p.all, conn)
