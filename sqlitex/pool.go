@@ -408,13 +408,8 @@ func (p *Pool) Put(conn *sqlite.Conn) error {
 		created, ok := p.createdAt[conn]
 		p.mu.RUnlock()
 		if ok && time.Since(created) >= p.config.ConnMaxLifetime {
-			p.mu.Lock()
-			delete(p.all, conn)
-			delete(p.createdAt, conn)
-			p.wg.Done()
-			p.mu.Unlock()
 			p.maxLifetimeClosed.Add(1)
-			if err := conn.Close(); err != nil {
+			if err := p.closeConn(conn); err != nil {
 				return errors.Join(dirtyErr, fmt.Errorf("failed to close expired connection: %v", err))
 			}
 			return dirtyErr
@@ -426,14 +421,8 @@ func (p *Pool) Put(conn *sqlite.Conn) error {
 		// Put the connection back into the idle pool if there's room.
 	default:
 		// If the idle pool is full, close the connection and remove it from the pool.
-		p.mu.Lock()
-		delete(p.all, conn)
-		delete(p.createdAt, conn)
-		p.wg.Done()
-		p.mu.Unlock()
 		p.maxIdleClosed.Add(1)
-
-		if err := conn.Close(); err != nil {
+		if err := p.closeConn(conn); err != nil {
 			return errors.Join(dirtyErr, fmt.Errorf("failed to close connection: %v", err))
 		}
 	}
@@ -484,20 +473,26 @@ func (p *Pool) cleanDirty(conn *sqlite.Conn) (discarded bool, err error) {
 
 	// Still dirty, so it must not be reused. Get opens a new connection when
 	// needed, as after ConnMaxLifetime expiry.
-	p.mu.Lock()
-	delete(p.all, conn)
-	delete(p.createdAt, conn)
-	p.wg.Done()
-	p.mu.Unlock()
-
 	err = fmt.Errorf("%w: %s; connection closed", ErrDirtyConn, what)
 	if rollbackErr != nil {
 		err = errors.Join(err, fmt.Errorf("rollback failed: %w", rollbackErr))
 	}
-	if closeErr := conn.Close(); closeErr != nil {
+	if closeErr := p.closeConn(conn); closeErr != nil {
 		err = errors.Join(err, fmt.Errorf("failed to close connection: %w", closeErr))
 	}
 	return true, err
+}
+
+// closeConn removes conn from the pool and closes it. It marks the wait group
+// only once conn.Close returns, so that a concurrent Close cannot return while
+// the connection still holds the database file and its locks.
+func (p *Pool) closeConn(conn *sqlite.Conn) error {
+	p.mu.Lock()
+	delete(p.all, conn)
+	delete(p.createdAt, conn)
+	p.mu.Unlock()
+	defer p.wg.Done()
+	return conn.Close()
 }
 
 // Close interrupts and closes all the connections in the Pool.
@@ -529,14 +524,9 @@ func (p *Pool) Close(ctx context.Context) (err error) {
 	for {
 		select {
 		case conn := <-p.idle:
-			p.mu.Lock()
-			delete(p.all, conn)
-			delete(p.createdAt, conn)
-			p.mu.Unlock()
-			if cErr := conn.Close(); cErr != nil {
+			if cErr := p.closeConn(conn); cErr != nil {
 				err = errors.Join(err, cErr)
 			}
-			p.wg.Done()
 		case <-allClosed:
 			return err
 		case <-ctx.Done():
