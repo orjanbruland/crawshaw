@@ -902,3 +902,56 @@ func TestVirtualTableWithTokenizer(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCloseWithUnfinalizedStmt(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	conn, err := sqlite.OpenConn(dbPath, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlitex.ExecScript(conn, "CREATE TABLE t (a); INSERT INTO t (a) VALUES (1);"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlitex.Execute(conn, "BEGIN IMMEDIATE;", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlitex.Execute(conn, "INSERT INTO t (a) VALUES (2);", nil); err != nil {
+		t.Fatal(err)
+	}
+	stmt, _, err := conn.PrepareTransient("SELECT a FROM t;")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := conn.Close(); sqlite.ErrCode(err) != sqlite.SQLITE_BUSY {
+		t.Errorf("Close with an unfinalized statement: got %v, want SQLITE_BUSY", err)
+	}
+
+	other, err := sqlite.OpenConn(dbPath, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	other.SetBusyTimeout(0) // Fail with SQLITE_BUSY rather than wait.
+	if err := sqlitex.Execute(other, "BEGIN IMMEDIATE;", nil); sqlite.ErrCode(err) != sqlite.SQLITE_BUSY {
+		t.Fatalf("BEGIN IMMEDIATE before the statement is finalized: got %v, want SQLITE_BUSY", err)
+	}
+
+	// Finalizing the last statement completes the close, which rolls back.
+	if err := stmt.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlitex.Execute(other, "BEGIN IMMEDIATE;", nil); err != nil {
+		t.Fatalf("BEGIN IMMEDIATE after the statement is finalized: %v", err)
+	}
+	n, err := sqlitex.ResultInt(other.Prep("SELECT count(*) FROM t;"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("got %d rows, want 1: the closed connection's transaction was committed", n)
+	}
+	if err := sqlitex.Execute(other, "ROLLBACK;", nil); err != nil {
+		t.Fatal(err)
+	}
+}

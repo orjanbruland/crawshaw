@@ -21,6 +21,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -694,4 +695,276 @@ func TestPoolInitScriptEdgeCases(t *testing.T) {
 			dbpool.Put(conn)
 		})
 	}
+}
+
+// openDirtyTestPool returns a pool of one connection to a new database file,
+// and the file's path. The database has a table t holding rows 1 and 2.
+func openDirtyTestPool(t *testing.T) (*sqlitex.Pool, string) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	dbpool, err := sqlitex.OpenConfig(t.Context(), sqlitex.PoolConfig{
+		URI:          "file:" + dbPath,
+		MaxOpenConns: 1,
+		MaxIdleConns: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// Close waits for every connection to come back. Bound it so that a
+		// leaked connection fails the test instead of hanging it.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := dbpool.Close(ctx); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	conn, err := dbpool.Get(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlitex.ExecScript(conn, "CREATE TABLE t (a); INSERT INTO t (a) VALUES (1), (2);"); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbpool.Put(conn); err != nil {
+		t.Fatal(err)
+	}
+	return dbpool, dbPath
+}
+
+// getSoon calls Get with a short timeout, so that a leaked active slot fails
+// the test instead of blocking it.
+func getSoon(t *testing.T, dbpool *sqlitex.Pool) *sqlite.Conn {
+	t.Helper()
+	// The context also interrupts the connection once done, so it must
+	// outlive this call.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(cancel)
+	conn, err := dbpool.Get(ctx)
+	if err != nil {
+		t.Fatalf("Get after a dirty Put: %v", err)
+	}
+	return conn
+}
+
+// beginWrite opens a write transaction on conn and inserts row 3 in it.
+func beginWrite(t *testing.T, conn *sqlite.Conn) {
+	t.Helper()
+	if err := sqlitex.Execute(conn, "BEGIN IMMEDIATE;", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlitex.Execute(conn, "INSERT INTO t (a) VALUES (3);", nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// checkRolledBack checks that conn is outside any transaction and that the
+// row beginWrite inserted is gone, then returns conn to dbpool.
+func checkRolledBack(t *testing.T, dbpool *sqlitex.Pool, conn *sqlite.Conn) {
+	t.Helper()
+	if !conn.GetAutocommit() {
+		t.Error("Get returned a connection inside a transaction")
+	}
+	n, err := sqlitex.ResultInt(conn.Prep("SELECT count(*) FROM t WHERE a = 3;"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Error("row inserted in the returned transaction is still there")
+	}
+	if err := dbpool.Put(conn); err != nil {
+		t.Errorf("Put of a clean connection: %v", err)
+	}
+}
+
+// checkWriteLockFree checks that a connection outside the pool can take the
+// write lock on the database at dbPath without waiting.
+func checkWriteLockFree(t *testing.T, dbPath string) {
+	t.Helper()
+	other, err := sqlite.OpenConn(dbPath, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	other.SetBusyTimeout(0) // Fail with SQLITE_BUSY rather than wait.
+	if err := sqlitex.Execute(other, "BEGIN IMMEDIATE;", nil); err != nil {
+		t.Fatalf("BEGIN IMMEDIATE on another connection: %v", err)
+	}
+	if err := sqlitex.Execute(other, "ROLLBACK;", nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPoolPutOpenTransaction(t *testing.T) {
+	for _, cancelCtx := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancelled=%v", cancelCtx), func(t *testing.T) {
+			dbpool, dbPath := openDirtyTestPool(t)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			conn, err := dbpool.Get(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beginWrite(t, conn)
+			if cancelCtx {
+				cancel()
+				// The caller cannot roll back itself: no statement prepares
+				// once the interrupt is armed.
+				if err := sqlitex.Execute(conn, "ROLLBACK;", nil); sqlite.ErrCode(err) != sqlite.SQLITE_INTERRUPT {
+					t.Fatalf("ROLLBACK after cancel: got %v, want SQLITE_INTERRUPT", err)
+				}
+			}
+
+			err = dbpool.Put(conn)
+			if !errors.Is(err, sqlitex.ErrDirtyConn) {
+				t.Errorf("Put: got %v, want ErrDirtyConn", err)
+			}
+			t.Logf("Put: %v", err)
+
+			got := getSoon(t, dbpool)
+			if got != conn {
+				t.Error("Put closed a connection it rolled back")
+			}
+			checkRolledBack(t, dbpool, got)
+			checkWriteLockFree(t, dbPath)
+		})
+	}
+}
+
+func TestPoolPutActiveStatement(t *testing.T) {
+	dbpool, _ := openDirtyTestPool(t)
+
+	conn, err := dbpool.Get(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt := conn.Prep("SELECT a FROM t;")
+	if hasRow, err := stmt.Step(); err != nil {
+		t.Fatal(err)
+	} else if !hasRow {
+		t.Fatal("SELECT returned no rows")
+	}
+
+	err = dbpool.Put(conn)
+	if !errors.Is(err, sqlitex.ErrDirtyConn) {
+		t.Fatalf("Put: got %v, want ErrDirtyConn", err)
+	}
+	t.Logf("Put: %v", err)
+
+	conn = getSoon(t, dbpool)
+	if query := conn.CheckReset(); query != "" {
+		t.Errorf("Get returned a connection with active statement %q", query)
+	}
+	if err := dbpool.Put(conn); err != nil {
+		t.Errorf("Put of a clean connection: %v", err)
+	}
+}
+
+func TestPoolPutClean(t *testing.T) {
+	dbpool, _ := openDirtyTestPool(t)
+
+	conn, err := dbpool.Get(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlitex.Execute(conn, "INSERT INTO t (a) VALUES (3);", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbpool.Put(conn); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	got := getSoon(t, dbpool)
+	if got != conn {
+		t.Error("Get did not return the idle connection")
+	}
+	if err := dbpool.Put(got); err != nil {
+		t.Errorf("Put: %v", err)
+	}
+}
+
+func TestPoolPutRollbackFails(t *testing.T) {
+	dbpool, dbPath := openDirtyTestPool(t)
+
+	conn, err := dbpool.Get(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	beginWrite(t, conn)
+	// Denying ROLLBACK leaves Put no way to end the transaction.
+	err = conn.SetAuthorizer(sqlite.AuthorizeFunc(func(info sqlite.ActionInfo) sqlite.AuthResult {
+		if info.Action == sqlite.SQLITE_TRANSACTION && info.Operation == "ROLLBACK" {
+			return sqlite.SQLITE_DENY
+		}
+		return 0
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = dbpool.Put(conn)
+	if !errors.Is(err, sqlitex.ErrDirtyConn) {
+		t.Errorf("Put: got %v, want ErrDirtyConn", err)
+	}
+	if sqlite.ErrCode(err) != sqlite.SQLITE_AUTH {
+		t.Errorf("Put: got %v, want the ROLLBACK error joined in", err)
+	}
+	t.Logf("Put: %v", err)
+	if open := dbpool.Stats().OpenConnections; open != 0 {
+		t.Errorf("OpenConnections = %d, want 0 after the connection was closed", open)
+	}
+
+	got := getSoon(t, dbpool)
+	if got == conn {
+		t.Fatal("Get returned the connection Put could not roll back")
+	}
+	checkRolledBack(t, dbpool, got)
+	checkWriteLockFree(t, dbPath)
+}
+
+// A statement the caller has not finalized keeps the native connection open
+// after Put fails to roll it back, so it keeps the write lock until the caller
+// finalizes the statement.
+func TestPoolPutRollbackFailsWithOpenStatement(t *testing.T) {
+	dbpool, dbPath := openDirtyTestPool(t)
+
+	conn, err := dbpool.Get(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	beginWrite(t, conn)
+	stmt, _, err := conn.PrepareTransient("SELECT a FROM t;")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = conn.SetAuthorizer(sqlite.AuthorizeFunc(func(info sqlite.ActionInfo) sqlite.AuthResult {
+		if info.Action == sqlite.SQLITE_TRANSACTION && info.Operation == "ROLLBACK" {
+			return sqlite.SQLITE_DENY
+		}
+		return 0
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = dbpool.Put(conn)
+	if !errors.Is(err, sqlitex.ErrDirtyConn) {
+		t.Errorf("Put: got %v, want ErrDirtyConn", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "connection closed") {
+		t.Errorf("Put: got %v, which claims a connection that is still open was closed", err)
+	}
+	t.Logf("Put: %v", err)
+
+	if err := stmt.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got := getSoon(t, dbpool)
+	if got == conn {
+		t.Fatal("Get returned the connection Put could not roll back")
+	}
+	checkRolledBack(t, dbpool, got)
+	checkWriteLockFree(t, dbPath)
 }

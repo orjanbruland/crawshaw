@@ -29,6 +29,11 @@ import (
 
 var ErrPoolClosed = errors.New("sqlite: pool is closed")
 
+// ErrDirtyConn is returned by Pool.Put, wrapped with details, when a connection
+// comes back inside a transaction or with a statement left mid-step. Put has
+// rolled back and reset the connection by then, or closed it if that failed.
+var ErrDirtyConn = errors.New("sqlite: dirty connection returned to pool")
+
 // Pool is a pool of SQLite connections.
 //
 // It is safe for use by multiple goroutines concurrently.
@@ -51,7 +56,7 @@ var ErrPoolClosed = errors.New("sqlite: pool is closed")
 type Pool struct {
 	// If checkReset, the Put method checks all of the connection's
 	// prepared statements and ensures they were correctly cleaned up.
-	// If they were not, Put returns an error with details.
+	// If they were not, Put resets them and returns an error with details.
 	//
 	// TODO: export this? Is it enough of a performance concern?
 	checkReset bool
@@ -358,19 +363,19 @@ func (p *Pool) Get(ctx context.Context) (conn *sqlite.Conn, err error) {
 // Put will return an error if conn is nil or if the conn was not originally created by
 // p.
 //
+// A connection returned inside a transaction, or with a statement still
+// returning rows, is dirty: handing it to the next caller would nest that
+// caller's work inside the stale transaction. Put rolls the transaction back
+// and resets the statement, with the interrupt cleared, so this works even
+// after the Get context is done. If the connection is still dirty afterwards,
+// Put closes it and Get opens a new one when needed. Either way Put returns
+// an error wrapping ErrDirtyConn.
+//
 // Applications must ensure that all non-nil Conns returned from Get are
 // returned to the same Pool with Put.
 func (p *Pool) Put(conn *sqlite.Conn) error {
 	if conn == nil {
 		return fmt.Errorf("attempted to Put a nil Conn into Pool")
-	}
-	if p.checkReset {
-		query := conn.CheckReset()
-		if query != "" {
-			panic(fmt.Errorf(
-				"connection returned to pool has active statement: %q",
-				query))
-		}
 	}
 
 	p.mu.RLock()
@@ -381,11 +386,20 @@ func (p *Pool) Put(conn *sqlite.Conn) error {
 		return fmt.Errorf("sqlite.Pool.Put: connection not created by this pool")
 	}
 
+	// Clean up before releasing the active slot, so that a Get waiting on a
+	// one-connection pool cannot open a new connection while this one still
+	// holds the write lock.
+	discarded, dirtyErr := p.cleanDirty(conn)
+
 	cancel()
 
 	// Always release the active slot since Get always acquires one.
 	if p.active != nil {
 		<-p.active
+	}
+
+	if discarded {
+		return dirtyErr
 	}
 
 	// Check if connection has exceeded its max lifetime.
@@ -394,16 +408,11 @@ func (p *Pool) Put(conn *sqlite.Conn) error {
 		created, ok := p.createdAt[conn]
 		p.mu.RUnlock()
 		if ok && time.Since(created) >= p.config.ConnMaxLifetime {
-			p.mu.Lock()
-			delete(p.all, conn)
-			delete(p.createdAt, conn)
-			p.wg.Done()
-			p.mu.Unlock()
 			p.maxLifetimeClosed.Add(1)
-			if err := conn.Close(); err != nil {
-				return fmt.Errorf("failed to close expired connection: %v", err)
+			if err := p.closeConn(conn); err != nil {
+				return errors.Join(dirtyErr, fmt.Errorf("failed to close expired connection: %v", err))
 			}
-			return nil
+			return dirtyErr
 		}
 	}
 
@@ -412,18 +421,85 @@ func (p *Pool) Put(conn *sqlite.Conn) error {
 		// Put the connection back into the idle pool if there's room.
 	default:
 		// If the idle pool is full, close the connection and remove it from the pool.
-		p.mu.Lock()
-		delete(p.all, conn)
-		delete(p.createdAt, conn)
-		p.wg.Done()
-		p.mu.Unlock()
 		p.maxIdleClosed.Add(1)
-
-		if err := conn.Close(); err != nil {
-			return fmt.Errorf("failed to close connection: %v", err)
+		if err := p.closeConn(conn); err != nil {
+			return errors.Join(dirtyErr, fmt.Errorf("failed to close connection: %v", err))
 		}
 	}
-	return nil
+	return dirtyErr
+}
+
+// cleanDirty returns nil if conn is clean. Otherwise it rolls back the open
+// transaction and resets the statement left mid-step, and returns an error
+// wrapping ErrDirtyConn that says what it found. If conn is still dirty after
+// that, cleanDirty also removes conn from the pool, closes it, and reports
+// discarded.
+func (p *Pool) cleanDirty(conn *sqlite.Conn) (discarded bool, err error) {
+	inTx := !conn.GetAutocommit()
+	var query string
+	if p.checkReset {
+		query = conn.CheckReset()
+	}
+	if !inTx && query == "" {
+		return false, nil
+	}
+
+	var found []string
+	if inTx {
+		found = append(found, "open transaction")
+	}
+	if query != "" {
+		found = append(found, fmt.Sprintf("active statement %q", query))
+	}
+	what := strings.Join(found, " and ")
+
+	// Get armed the interrupt with its ctx, which may be done by now, and no
+	// statement prepares while it is: ROLLBACK included. Clearing it also
+	// resets the statement left mid-step.
+	conn.SetInterrupt(nil)
+
+	var rollbackErr error
+	if inTx {
+		// Transient, so the pool leaves no cached statement on the connection.
+		rollbackErr = ExecuteTransient(conn, "ROLLBACK;", nil)
+	}
+	if rollbackErr == nil && conn.GetAutocommit() && (!p.checkReset || conn.CheckReset() == "") {
+		outcome := "statement reset"
+		if inTx {
+			outcome = "rolled back"
+		}
+		return false, fmt.Errorf("%w: %s; %s", ErrDirtyConn, what, outcome)
+	}
+
+	// Still dirty, so it must not be reused. Get opens a new connection when
+	// needed, as after ConnMaxLifetime expiry.
+	closeErr := p.closeConn(conn)
+	outcome := "connection closed"
+	if closeErr != nil {
+		outcome = "connection discarded"
+	}
+	err = fmt.Errorf("%w: %s; %s", ErrDirtyConn, what, outcome)
+	if rollbackErr != nil {
+		err = errors.Join(err, fmt.Errorf("rollback failed: %w", rollbackErr))
+	}
+	if closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("failed to close connection: %w", closeErr))
+	}
+	return true, err
+}
+
+// closeConn removes conn from the pool and closes it. It marks the wait group
+// only once conn.Close returns, so that a concurrent Close cannot return while
+// the connection still holds the database file and its locks. A connection
+// that Close leaves for SQLite to close later, once the caller finalizes its
+// statements, is not waited for.
+func (p *Pool) closeConn(conn *sqlite.Conn) error {
+	p.mu.Lock()
+	delete(p.all, conn)
+	delete(p.createdAt, conn)
+	p.mu.Unlock()
+	defer p.wg.Done()
+	return conn.Close()
 }
 
 // Close interrupts and closes all the connections in the Pool.
@@ -455,14 +531,9 @@ func (p *Pool) Close(ctx context.Context) (err error) {
 	for {
 		select {
 		case conn := <-p.idle:
-			p.mu.Lock()
-			delete(p.all, conn)
-			delete(p.createdAt, conn)
-			p.mu.Unlock()
-			if cErr := conn.Close(); cErr != nil {
+			if cErr := p.closeConn(conn); cErr != nil {
 				err = errors.Join(err, cErr)
 			}
-			p.wg.Done()
 		case <-allClosed:
 			return err
 		case <-ctx.Done():
