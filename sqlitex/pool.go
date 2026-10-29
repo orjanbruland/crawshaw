@@ -207,6 +207,16 @@ type PoolConfig struct {
 	// instead of being returned to the idle pool.
 	// If ConnMaxLifetime is zero or negative, connections are not closed based on age.
 	ConnMaxLifetime time.Duration
+
+	// Tracer, if set, is called by Get for each connection it returns, with
+	// the context passed to Get, or context.Background() if that is nil. The
+	// connection reports its statements and savepoints to the returned
+	// sqlite.Tracer until it is Put back. A nil sqlite.Tracer disables
+	// tracing for that connection. See sqlite.Tracer for the events.
+	//
+	// If Tracer is not set, connections from Get with a non-nil context
+	// report to runtime/trace.
+	Tracer func(ctx context.Context) sqlite.Tracer
 }
 
 // OpenConfig opens a pool of SQLite connections with the provided configuration.
@@ -259,10 +269,8 @@ func OpenConfig(ctx context.Context, config PoolConfig) (pool *Pool, err error) 
 // Applications must ensure that all non-nil Conns returned from Get are
 // returned to the same Pool with Put.
 func (p *Pool) Get(ctx context.Context) (conn *sqlite.Conn, err error) {
-	var tr sqlite.Tracer
-	if ctx != nil {
-		tr = &tracer{ctx: ctx}
-	} else {
+	getCtx := ctx
+	if ctx == nil {
 		ctx = context.Background()
 	}
 	var cancel context.CancelFunc
@@ -334,7 +342,7 @@ func (p *Pool) Get(ctx context.Context) (conn *sqlite.Conn, err error) {
 		}
 	}
 
-	conn.SetTracer(tr)
+	conn.SetTracer(p.newTracer(getCtx))
 	conn.SetInterrupt(ctx.Done())
 
 	if newConn && p.config.InitScript != "" {
@@ -356,6 +364,20 @@ func (p *Pool) Get(ctx context.Context) (conn *sqlite.Conn, err error) {
 	p.mu.Unlock()
 
 	return conn, nil
+}
+
+// newTracer returns the tracer for a connection that Get(ctx) returns.
+func (p *Pool) newTracer(ctx context.Context) sqlite.Tracer {
+	if p.config.Tracer != nil {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		return p.config.Tracer(ctx)
+	}
+	if ctx == nil {
+		return nil
+	}
+	return &tracer{ctx: ctx}
 }
 
 // Put puts an SQLite connection back into the Pool.
@@ -390,6 +412,10 @@ func (p *Pool) Put(conn *sqlite.Conn) error {
 	// one-connection pool cannot open a new connection while this one still
 	// holds the write lock.
 	discarded, dirtyErr := p.cleanDirty(conn)
+
+	// After cleanDirty, so its rollback is traced. An idle connection must not
+	// keep the Get context reachable, nor report to it.
+	conn.SetTracer(nil)
 
 	cancel()
 
