@@ -335,16 +335,47 @@ func (conn *Conn) CheckReset() string {
 	return ""
 }
 
+// A Tracer receives events from a Conn, for building traces with
+// runtime/trace, OpenTelemetry or similar. Set one with SetTracer, or for
+// pooled connections with sqlitex.PoolConfig.Tracer.
+//
+// NewTask is called when a statement starts executing: on the first Step
+// after Prepare, PrepareTransient or Reset. The name is the statement's SQL.
+//
+// Push and Pop bracket a group of statements, such as a sqlitex.Savepoint.
+// Tasks created between them belong to that group. Groups may nest.
+//
+// Methods are called on the goroutine using the Conn.
 type Tracer interface {
 	NewTask(name string) TracerTask
 	Push(name string)
 	Pop()
 }
 
+// A TracerTask is one execution of a statement. StartRegion("Step") and
+// EndRegion bracket each sqlite3_step. End is called once: when Step reports
+// no more rows or an error, or when the statement is Reset or Finalized
+// before that.
 type TracerTask interface {
 	StartRegion(regionType string)
 	EndRegion()
 	End()
+}
+
+// TracerTaskWithError is implemented by a TracerTask that wants to know how
+// its statement ended. EndWithError is then called in place of End, with the
+// error Step returned, or nil if the statement finished or was reset early.
+type TracerTaskWithError interface {
+	TracerTask
+	EndWithError(err error)
+}
+
+// TracerWithError is implemented by a Tracer that wants to know how a group
+// ended. PopWithError is then called in place of Pop, with the error the group
+// ended with, or nil.
+type TracerWithError interface {
+	Tracer
+	PopWithError(err error)
 }
 
 func (conn *Conn) Tracer() Tracer {
@@ -559,11 +590,6 @@ func (conn *Conn) Prepare(query string) (*Stmt, error) {
 		if err := stmt.ClearBindings(); err != nil {
 			return nil, err
 		}
-		if conn.tracer != nil {
-			// TODO: is query too long for a task name?
-			//       should we use trace.Log instead?
-			stmt.tracerTask = conn.tracer.NewTask(query)
-		}
 		return stmt, nil
 	}
 	stmt, trailingBytes, err := conn.prepare(query, C.SQLITE_PREPARE_PERSISTENT)
@@ -575,9 +601,6 @@ func (conn *Conn) Prepare(query string) (*Stmt, error) {
 		return nil, reserr("Conn.Prepare", query, "statement has trailing bytes", C.SQLITE_ERROR)
 	}
 	conn.stmts[query] = stmt
-	if conn.tracer != nil {
-		stmt.tracerTask = conn.tracer.NewTask(query)
-	}
 	return stmt, nil
 }
 
@@ -713,9 +736,23 @@ type Stmt struct {
 	colNames      map[string]int
 	bindErr       error
 	cleanup       runtime.Cleanup
-	prepInterrupt bool // set if Prep was interrupted
-	lastHasRow    bool // last bool returned by Step
-	tracerTask    TracerTask
+	prepInterrupt bool       // set if Prep was interrupted
+	lastHasRow    bool       // last bool returned by Step
+	tracerTask    TracerTask // current execution's task, or nil
+}
+
+// endTrace ends the task of the current execution, if any.
+func (stmt *Stmt) endTrace(err error) {
+	task := stmt.tracerTask
+	if task == nil {
+		return
+	}
+	stmt.tracerTask = nil
+	if t, ok := task.(TracerTaskWithError); ok {
+		t.EndWithError(err)
+	} else {
+		task.End()
+	}
 }
 
 func (stmt *Stmt) interrupted(loc string) error {
@@ -736,6 +773,7 @@ func (stmt *Stmt) interrupted(loc string) error {
 // https://www.sqlite.org/c3ref/finalize.html
 func (stmt *Stmt) Finalize() error {
 	stmt.cleanup.Stop()
+	stmt.endTrace(nil)
 	stmt.conn.count++
 	if ptr := stmt.conn.stmts[stmt.query]; ptr == stmt {
 		delete(stmt.conn.stmts, stmt.query)
@@ -753,6 +791,7 @@ func (stmt *Stmt) Finalize() error {
 // https://www.sqlite.org/c3ref/reset.html
 func (stmt *Stmt) Reset() error {
 	stmt.conn.count++
+	stmt.endTrace(nil)
 	stmt.lastHasRow = false
 	var res C.int
 	for {
@@ -816,9 +855,13 @@ func (stmt *Stmt) ClearBindings() error {
 //
 //	http://www.sqlite.org/unlock_notify.html
 func (stmt *Stmt) Step() (rowReturned bool, err error) {
+	if stmt.tracerTask == nil && stmt.conn.tracer != nil {
+		stmt.tracerTask = stmt.conn.tracer.NewTask(stmt.query)
+	}
 	if stmt.bindErr != nil {
 		err = stmt.bindErr
 		stmt.bindErr = nil
+		stmt.endTrace(err)
 		stmt.Reset()
 		return false, err
 	}
@@ -830,8 +873,7 @@ func (stmt *Stmt) Step() (rowReturned bool, err error) {
 	if stmt.tracerTask != nil {
 		stmt.tracerTask.EndRegion()
 		if !rowReturned {
-			stmt.tracerTask.End()
-			stmt.tracerTask = nil
+			stmt.endTrace(err)
 		}
 	}
 	if err != nil {

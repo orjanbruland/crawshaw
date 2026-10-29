@@ -70,18 +70,23 @@ func savepoint(conn *sqlite.Conn, name string) (releaseFn func(*error), err erro
 	if strings.Contains(name, `"`) {
 		return nil, fmt.Errorf("sqlitex.Savepoint: invalid name: %q", name)
 	}
-	if err := Exec(conn, fmt.Sprintf("SAVEPOINT %q;", name), nil); err != nil {
-		return nil, err
-	}
 	tracer := conn.Tracer()
 	if tracer != nil {
 		tracer.Push("TX " + name)
 	}
-	releaseFn = func(errp *error) {
+	if err := Exec(conn, fmt.Sprintf("SAVEPOINT %q;", name), nil); err != nil {
 		if tracer != nil {
-			tracer.Pop()
+			popTracer(tracer, err, nil)
 		}
+		return nil, err
+	}
+	releaseFn = func(errp *error) {
 		recoverP := recover()
+		if tracer != nil {
+			// Deferred, so the group covers RELEASE or ROLLBACK and sees
+			// how the savepoint ended.
+			defer func() { popTracer(tracer, *errp, recoverP) }()
+		}
 
 		// If a query was interrupted or if a user exec'd COMMIT or
 		// ROLLBACK, then everything was already rolled back
@@ -133,4 +138,18 @@ func savepoint(conn *sqlite.Conn, name string) (releaseFn func(*error), err erro
 		}
 	}
 	return releaseFn, nil
+}
+
+// popTracer ends the tracer group of a savepoint that ended with err, or
+// with the panic value recoverP.
+func popTracer(tracer sqlite.Tracer, err error, recoverP any) {
+	t, ok := tracer.(sqlite.TracerWithError)
+	if !ok {
+		tracer.Pop()
+		return
+	}
+	if err == nil && recoverP != nil {
+		err = fmt.Errorf("panic: %v", recoverP)
+	}
+	t.PopWithError(err)
 }
