@@ -25,10 +25,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+	"weak"
 
 	qt "github.com/go-quicktest/qt"
 
@@ -951,6 +953,92 @@ func TestCloseWithUnfinalizedStmt(t *testing.T) {
 		t.Errorf("got %d rows, want 1: the closed connection's transaction was committed", n)
 	}
 	if err := sqlitex.Execute(other, "ROLLBACK;", nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The busy handler is a closure over the Conn, kept in the global cgo handle
+// table, so the Conn stays reachable until Close deletes the handle.
+func TestCloseReleasesConn(t *testing.T) {
+	const n = 10
+	refs := make([]weak.Pointer[sqlite.Conn], n)
+	func() {
+		for i := range refs {
+			conn, err := sqlite.OpenConn(":memory:", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			refs[i] = weak.Make(conn)
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}()
+
+	runtime.GC()
+	live := 0
+	for _, ref := range refs {
+		if ref.Value() != nil {
+			live++
+		}
+	}
+	if live != 0 {
+		t.Errorf("%d of %d closed connections are still reachable", live, n)
+	}
+}
+
+// A statement that outlives Close keeps the SQLite connection open, and SQLite
+// would still call a busy handler registered on it. Close must unregister the
+// handler rather than only delete its handle.
+func TestStepAfterCloseWhenBusy(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	conn, err := sqlite.OpenConn(dbPath, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlitex.ExecScript(conn, "CREATE TABLE t (a);"); err != nil {
+		t.Fatal(err)
+	}
+	stmt, _, err := conn.PrepareTransient("INSERT INTO t (a) VALUES (1);")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); sqlite.ErrCode(err) != sqlite.SQLITE_BUSY {
+		t.Fatalf("Close with an unfinalized statement: got %v, want SQLITE_BUSY", err)
+	}
+
+	other, err := sqlite.OpenConn(dbPath, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := sqlitex.Execute(other, "BEGIN IMMEDIATE;", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	stepErr := make(chan error, 1)
+	go func() {
+		_, err := stmt.Step()
+		stepErr <- err
+	}()
+	waiting := false
+	select {
+	case err := <-stepErr:
+		if sqlite.ErrCode(err) != sqlite.SQLITE_BUSY {
+			t.Errorf("Step after Close on a locked database: got %v, want SQLITE_BUSY", err)
+		}
+	case <-time.After(5 * time.Second):
+		waiting = true
+		t.Error("Step after Close is waiting on the busy handler")
+	}
+
+	if err := sqlitex.Execute(other, "ROLLBACK;", nil); err != nil {
+		t.Fatal(err)
+	}
+	if waiting {
+		<-stepErr
+	}
+	if err := stmt.Finalize(); err != nil {
 		t.Fatal(err)
 	}
 }
