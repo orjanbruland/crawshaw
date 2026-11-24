@@ -265,7 +265,8 @@ func openConn(path string, flags ...OpenFlags) (*Conn, error) {
 // If a statement from PrepareTransient is not yet finalized, or a backup is
 // unfinished, Close returns an SQLITE_BUSY error, and SQLite closes the
 // connection once they finish. Until then the connection keeps any open
-// transaction and its locks.
+// transaction and its locks, but it has no busy handler: a statement stepped
+// after Close returns SQLITE_BUSY rather than wait for a lock.
 func (conn *Conn) Close() error {
 	conn.cleanup.Stop()
 	conn.cancelInterrupt()
@@ -273,6 +274,11 @@ func (conn *Conn) Close() error {
 	for _, stmt := range conn.stmts {
 		stmt.Finalize()
 	}
+	// The busy handler closes over conn, and its cgo handle keeps conn
+	// reachable until deleted. Unregister the handler rather than only delete
+	// the handle: if sqlite3_close returns SQLITE_BUSY the connection lives
+	// on, and SQLite would call back with a handle that is gone.
+	conn.setBusyHandler(nil)
 	res := C.sqlite3_close(conn.conn)
 	var msg string
 	if res == C.SQLITE_BUSY {
